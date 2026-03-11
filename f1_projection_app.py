@@ -202,6 +202,18 @@ OFFSET_FP_TO_QUALI = 0.0
 RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
 SPRINT_POINTS = {1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1}
 
+SPRINT_CIRCUITS = {
+    "shanghai":    {"sprint_laps": 19},
+    "miami":       {"sprint_laps": 19},
+    "montreal":    {"sprint_laps": 23},
+    "silverstone": {"sprint_laps": 17},
+    "zandvoort":   {"sprint_laps": 24},
+    "singapore":   {"sprint_laps": 21},
+}
+
+SQ_TO_SPRINT_FACTOR = 1.03   # Sprint qualifying → sprint race pace (~3% degradation)
+SPRINT_DNF_FACTOR = 0.50     # Sprint DNF probability = 50% of race DNF
+
 # ---------------------------------------------------------------------------
 # F1DB Integration Constants (latest / current-season data)
 # ---------------------------------------------------------------------------
@@ -896,6 +908,69 @@ def fetch_qualifying_times(conn, circuit_key, year=2026):
         return {}
 
 
+def fetch_sprint_qualifying_results(conn, circuit_key, year=2026):
+    """Fetch sprint qualifying grid positions from f1db SQLite."""
+    if conn is None:
+        return {}
+    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
+    f1db_circuit = CIRCUIT_F1DB_IDS.get(circuit_key)
+    if f1db_circuit is None:
+        return {}
+    try:
+        rows = conn.execute("""
+            SELECT rd.driver_id, rd.position_number
+            FROM race_data rd
+            JOIN race r ON rd.race_id = r.id
+            WHERE rd.type = 'SPRINT_QUALIFYING_RESULT'
+              AND r.year = ? AND r.circuit_id = ?
+            ORDER BY rd.position_display_order
+        """, (year, f1db_circuit)).fetchall()
+        results = {}
+        for row in rows:
+            driver_name = f1db_to_driver.get(row["driver_id"])
+            if driver_name:
+                results[driver_name] = row["position_number"]
+        return results
+    except sqlite3.Error:
+        return {}
+
+
+def fetch_sprint_qualifying_times(conn, circuit_key, year=2026):
+    """Fetch best sprint qualifying lap times from f1db SQLite."""
+    if conn is None:
+        return {}
+    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
+    f1db_circuit = CIRCUIT_F1DB_IDS.get(circuit_key)
+    if f1db_circuit is None:
+        return {}
+    try:
+        rows = conn.execute("""
+            SELECT rd.driver_id, rd.q1, rd.q2, rd.q3
+            FROM race_data rd
+            JOIN race r ON rd.race_id = r.id
+            WHERE rd.type = 'SPRINT_QUALIFYING_RESULT'
+              AND r.year = ? AND r.circuit_id = ?
+        """, (year, f1db_circuit)).fetchall()
+        results = {}
+        for row in rows:
+            driver_name = f1db_to_driver.get(row["driver_id"])
+            if not driver_name:
+                continue
+            best_t = None
+            for col in ("q3", "q2", "q1"):
+                val = row[col] if col in row.keys() else None
+                if val is not None:
+                    t = _parse_quali_time(str(val))
+                    if t is not None:
+                        best_t = t
+                        break
+            if best_t is not None:
+                results[driver_name] = best_t
+        return results
+    except sqlite3.Error:
+        return {}
+
+
 def compute_auto_calibration(conn, year=2026):
     """Compute GLOBAL_CORRECTION from actual vs projected winner times."""
     if conn is None:
@@ -1026,6 +1101,8 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
         "season_calendar": [],
         "quali_results": {},
         "quali_times": {},
+        "sprint_quali_results": {},
+        "sprint_quali_times": {},
         "calibration_correction": 1.0,
         "calibration_races": 0,
     }
@@ -1126,6 +1203,31 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
             if quali_times_map:
                 result["quali_times"][circuit_key] = quali_times_map
 
+        # Fetch sprint qualifying for sprint rounds
+        if circuit_key in SPRINT_CIRCUITS:
+            sq_text = _fetch_raw_text(
+                f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/sprint-qualifying-results.yml")
+            if sq_text:
+                sq_map = {}
+                sq_times_map = {}
+                for entry in _parse_simple_yaml_list(sq_text):
+                    dn = f1db_to_driver.get(entry.get("driverId"))
+                    if dn and entry.get("position") is not None:
+                        sq_map[dn] = entry["position"]
+                    if dn:
+                        best_t = None
+                        for qkey in ("q3", "q2", "q1"):
+                            t = _parse_quali_time(str(entry.get(qkey, "")))
+                            if t is not None:
+                                best_t = t
+                                break
+                        if best_t is not None:
+                            sq_times_map[dn] = best_t
+                if sq_map:
+                    result["sprint_quali_results"][circuit_key] = sq_map
+                if sq_times_map:
+                    result["sprint_quali_times"][circuit_key] = sq_times_map
+
     # Set latest race (highest completed round)
     if completed:
         latest_key = max(completed, key=lambda k: completed[k]["round"])
@@ -1139,7 +1241,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
             "date": "",
             "grand_prix": slug.split('-', 1)[1],
             "circuit_id": CIRCUIT_F1DB_IDS.get(circuit_key, ""),
-            "is_sprint": False,
+            "is_sprint": circuit_key in SPRINT_CIRCUITS,
             "completed": circuit_key in completed,
         })
 
@@ -1250,7 +1352,7 @@ def compute_driver_dnf_probability(driver_name, circuit_key, historical):
     return max(0.01, min(0.30, blended))
 
 
-def calculate_expected_points(projections, overtaking_factor):
+def calculate_expected_points(projections, overtaking_factor, points_table=None):
     """Calculate expected points accounting for overtaking difficulty and DNF probability.
 
     At circuits where overtaking is difficult, position uncertainty is higher:
@@ -1261,10 +1363,13 @@ def calculate_expected_points(projections, overtaking_factor):
     Args:
         projections: List of projection dicts (already sorted by time_s).
         overtaking_factor: 0.0 (impossible) to 1.0 (very easy).
+        points_table: Points dict mapping position to points (default: RACE_POINTS).
 
     Returns:
         List of expected points values (same order as projections).
     """
+    if points_table is None:
+        points_table = RACE_POINTS
     n = len(projections)
     # Position uncertainty bandwidth: how many positions a driver might
     # realistically shift due to non-pace factors. Lower overtaking = wider band.
@@ -1274,7 +1379,7 @@ def calculate_expected_points(projections, overtaking_factor):
     expected = []
     for i in range(n):
         pos = i + 1
-        base_pts = RACE_POINTS.get(pos, 0)
+        base_pts = points_table.get(pos, 0)
 
         if bandwidth < 0.1:
             # High-overtaking circuit: pace fully determines position
@@ -1288,7 +1393,7 @@ def calculate_expected_points(projections, overtaking_factor):
 
         for j in range(n):
             neighbor_pos = j + 1
-            neighbor_pts = RACE_POINTS.get(neighbor_pos, 0)
+            neighbor_pts = points_table.get(neighbor_pos, 0)
             dist = abs(i - j)
             # Gaussian weight: exp(-(dist^2) / (2 * sigma^2))
             weight = math.exp(-(dist ** 2) / (2 * sigma ** 2))
@@ -1571,6 +1676,86 @@ def calculate_qualifying_projections(circuit_key: str,
     return results
 
 
+def calculate_sprint_projections(circuit_key: str,
+                                 sq_positions: dict,
+                                 sq_times: dict | None = None,
+                                 historical: dict | None = None) -> list[dict]:
+    """Calculate projected sprint race outcome based on sprint qualifying data.
+
+    Uses SQ times when available, falls back to FP1 composite baseline.
+    Sprint-specific: shorter distance, lower degradation, reduced DNF probability.
+    Returns empty list if the circuit does not host a sprint race.
+    """
+    sprint_info = SPRINT_CIRCUITS.get(circuit_key)
+    if not sprint_info:
+        return []
+
+    sprint_laps = sprint_info["sprint_laps"]
+    circuit = CIRCUITS_2026[circuit_key]
+    target_ratio = circuit["ratio"]
+    circuit_type = circuit["type"]
+    overtaking = CIRCUIT_OVERTAKING.get(circuit_key, 0.50)
+
+    results = []
+    for driver in DRIVERS_2026:
+        sq_pos = sq_positions.get(driver["name"])
+        hist_factor = (compute_historical_factor(driver["name"], circuit_key, historical)
+                       if historical else 1.0)
+        race_dnf = compute_driver_dnf_probability(driver["name"], circuit_key, historical)
+        sprint_dnf = race_dnf * SPRINT_DNF_FACTOR
+        affinity = TEAM_AFFINITIES.get(driver["tag"], {}).get(circuit_type, 1.0)
+
+        sq_time = (sq_times or {}).get(driver["name"])
+        if sq_time is not None:
+            projected_lap = sq_time * SQ_TO_SPRINT_FACTOR * affinity * GLOBAL_CORRECTION * hist_factor
+        else:
+            baseline = compute_composite_baseline(driver)
+            projected_lap = project_lap_time(baseline, target_ratio, affinity, GLOBAL_CORRECTION) * hist_factor
+
+        total_time = projected_lap * sprint_laps
+
+        results.append({
+            "driver": driver["name"],
+            "num": driver["num"],
+            "team": driver["team"],
+            "tag": driver["tag"],
+            "data_quality": driver.get("data_quality", "measured"),
+            "time_s": total_time,
+            "time_str": format_race_time(total_time),
+            "lap_s": projected_lap,
+            "lap_str": format_lap_time(projected_lap),
+            "hist_factor": hist_factor,
+            "dnf_prob": sprint_dnf,
+            "quali_pos": sq_pos,
+        })
+
+    # Sort by SQ position (grid order); drivers without position sorted by time
+    results.sort(key=lambda r: (r["quali_pos"] if r["quali_pos"] is not None else 99,
+                                r["time_s"]))
+
+    leader_time = results[0]["time_s"]
+    for r in results:
+        r["gap"] = round(r["time_s"] - leader_time, 3)
+        r["gap_str"] = format_gap(r["gap"])
+
+    for i, r in enumerate(results):
+        r["proj_pts"] = SPRINT_POINTS.get(i + 1, 0)
+
+    for r in results:
+        r["sprint_mode"] = True
+
+    # Expected points using SPRINT_POINTS table
+    exp_pts_list = calculate_expected_points(results, overtaking, points_table=SPRINT_POINTS)
+    for i, r in enumerate(results):
+        ep = exp_pts_list[i]
+        r["exp_pts"] = round(ep["exp_pts"] * (1.0 - r["dnf_prob"]), 2)
+        r["pos_low"] = ep["pos_low"]
+        r["pos_high"] = ep["pos_high"]
+        r["dnf_pct"] = f"{r['dnf_prob'] * 100:.0f}%"
+
+    return results
+
+
 def calculate_season_projection(historical: dict | None = None,
                                 actual_standings: list | None = None,
                                 season_calendar: list | None = None) -> list[dict]:
@@ -1621,6 +1806,15 @@ def calculate_season_projection(historical: dict | None = None,
                 driver_totals[p["driver"]]["projected_pts"] += p["exp_pts"]
                 driver_totals[p["driver"]]["races_projected"] += 1
 
+    # Project sprint races for remaining sprint circuits
+    for circuit_key in SPRINT_CIRCUITS:
+        if circuit_key in completed_circuits:
+            continue
+        sprint_proj = calculate_sprint_projections(circuit_key, {}, None, historical)
+        for sp in sprint_proj:
+            if sp["driver"] in driver_totals:
+                driver_totals[sp["driver"]]["projected_pts"] += sp["exp_pts"]
+
     # Combine actual + projected
     result = []
     for dt in driver_totals.values():
@@ -1663,6 +1857,8 @@ class F1ProjectionApp(tk.Tk):
         self.historical_data = None
         self.quali_results = {}  # circuit_key -> {driver_name: position}
         self.quali_times = {}    # circuit_key -> {driver_name: best_q_time_seconds}
+        self.sprint_quali_results = {}  # circuit_key -> {driver_name: sq_position}
+        self.sprint_quali_times = {}    # circuit_key -> {driver_name: best_sq_time_seconds}
 
         # Track collapsible section state
         self._collapsed = {}  # section_name -> bool
@@ -1735,7 +1931,7 @@ class F1ProjectionApp(tk.Tk):
         self.circuit_combo.bind("<<ComboboxSelected>>", lambda e: self.on_circuit_selected())
 
         ttk.Label(frame, text="Mode:").pack(side="left", padx=(0, 5))
-        self.mode_combo = ttk.Combobox(frame, values=["Practice", "Qualifying"],
+        self.mode_combo = ttk.Combobox(frame, values=["Practice", "Qualifying", "Sprint"],
                                         state="readonly", width=12)
         self.mode_combo.current(0)
         self.mode_combo.pack(side="left", padx=(0, 15))
@@ -1840,6 +2036,17 @@ class F1ProjectionApp(tk.Tk):
                     qt = fetch_qualifying_times(conn, circuit_key)
                     if qt:
                         self.quali_times[circuit_key] = qt
+                # Sprint qualifying data (SQLite)
+                for ck in SPRINT_CIRCUITS:
+                    try:
+                        sq_r = fetch_sprint_qualifying_results(conn, ck)
+                        if sq_r:
+                            self.sprint_quali_results[ck] = sq_r
+                        sq_t = fetch_sprint_qualifying_times(conn, ck)
+                        if sq_t:
+                            self.sprint_quali_times[ck] = sq_t
+                    except Exception:
+                        pass
             finally:
                 conn.close()
 
@@ -1864,6 +2071,8 @@ class F1ProjectionApp(tk.Tk):
                 for ck, qt in raw.get("quali_times", {}).items():
                     if ck not in self.quali_times:
                         self.quali_times[ck] = qt
+                self.sprint_quali_results = raw.get("sprint_quali_results", {})
+                self.sprint_quali_times = raw.get("sprint_quali_times", {})
                 if raw.get("calibration_races", 0) > 0:
                     GLOBAL_CORRECTION = raw["calibration_correction"]
                     self.calibration_races = raw["calibration_races"]
@@ -2135,7 +2344,21 @@ class F1ProjectionApp(tk.Tk):
         quali = self.quali_results.get(circuit_key, {})
         quali_times = self.quali_times.get(circuit_key, {})
 
-        if mode == "Qualifying" and quali:
+        if mode == "Sprint":
+            if circuit_key in SPRINT_CIRCUITS:
+                sq_pos = self.sprint_quali_results.get(circuit_key, {})
+                sq_times_data = self.sprint_quali_times.get(circuit_key, {})
+                projections = calculate_sprint_projections(
+                    circuit_key, sq_pos, sq_times_data, self.historical_data)
+                sprint_info = SPRINT_CIRCUITS[circuit_key]
+                mode_text = f"Sprint ({sprint_info['sprint_laps']} laps) · SQ + FP1"
+                if not sq_pos:
+                    mode_text += " (no sprint qualifying data yet)"
+            else:
+                projections = calculate_all_projections(
+                    circuit_key, self.historical_data, quali or None)
+                mode_text = "No sprint race at this circuit — showing Practice projection"
+        elif mode == "Qualifying" and quali:
             projections = calculate_qualifying_projections(
                 circuit_key, quali, quali_times, self.historical_data)
             mode_text = "Qualifying + Historical"
