@@ -1,10 +1,10 @@
 """F1 2026 Race Time Projection App
 
 Projects total race times for all 22 drivers across the 2026 calendar
-using Albert Park FP2 baselines scaled by circuit ratios, team-affinity
-multipliers, and race lap counts.  Includes per-circuit overtaking
-difficulty coefficients and per-driver DNF probabilities to compute
-expected points (E[Pts]).
+using Albert Park FP1/FP2/FP3 baselines (weighted composite) scaled by
+circuit ratios, team-affinity multipliers, and race lap counts.  Includes
+per-circuit overtaking difficulty coefficients and per-driver DNF
+probabilities to compute expected points (E[Pts]).
 """
 
 import tkinter as tk
@@ -53,32 +53,62 @@ CIRCUITS_2026 = {
     "yas_marina": {"name": "Abu Dhabi GP", "location": "Abu Dhabi", "km": 5.281, "turns": 16, "type": "mixed", "ratio": 1.079, "laps": 58},
 }
 
-# Step 1.2 – Driver roster (22 drivers, FP2 baselines from Albert Park)
-# data_quality: "measured" = representative FP2 lap, "estimated" = indirect estimation
+# Step 1.2 – Driver roster (22 drivers, FP1/FP2/FP3 baselines from Albert Park)
+# data_quality: "measured" = representative lap set, "estimated" = indirect estimation
+# fp1/fp2/fp3: best lap time in seconds from each session (None = no representative time)
 DRIVERS_2026 = [
-    {"name": "Oscar Piastri", "num": 81, "team": "McLaren", "tag": "mclaren", "fp2": 79.729, "data_quality": "measured"},
-    {"name": "Kimi Antonelli", "num": 12, "team": "Mercedes", "tag": "mercedes", "fp2": 79.943, "data_quality": "measured"},
-    {"name": "George Russell", "num": 63, "team": "Mercedes", "tag": "mercedes", "fp2": 80.049, "data_quality": "measured"},
-    {"name": "Lewis Hamilton", "num": 44, "team": "Ferrari", "tag": "ferrari", "fp2": 80.050, "data_quality": "measured"},
-    {"name": "Charles Leclerc", "num": 16, "team": "Ferrari", "tag": "ferrari", "fp2": 80.291, "data_quality": "measured"},
-    {"name": "Max Verstappen", "num": 3, "team": "Red Bull Racing", "tag": "red_bull", "fp2": 80.366, "data_quality": "measured"},
-    {"name": "Lando Norris", "num": 1, "team": "McLaren", "tag": "mclaren", "fp2": 80.794, "data_quality": "measured"},
-    {"name": "Arvid Lindblad", "num": 41, "team": "Racing Bulls", "tag": "racing_bulls", "fp2": 80.922, "data_quality": "measured"},
-    {"name": "Isack Hadjar", "num": 6, "team": "Red Bull Racing", "tag": "red_bull", "fp2": 80.941, "data_quality": "measured"},
-    {"name": "Esteban Ocon", "num": 31, "team": "Haas", "tag": "haas", "fp2": 81.179, "data_quality": "measured"},
-    {"name": "Oliver Bearman", "num": 87, "team": "Haas", "tag": "haas", "fp2": 81.326, "data_quality": "measured"},
-    {"name": "Nico Hulkenberg", "num": 27, "team": "Audi", "tag": "audi", "fp2": 81.351, "data_quality": "measured"},
-    {"name": "Liam Lawson", "num": 30, "team": "Racing Bulls", "tag": "racing_bulls", "fp2": 81.358, "data_quality": "measured"},
-    {"name": "Gabriel Bortoleto", "num": 5, "team": "Audi", "tag": "audi", "fp2": 81.668, "data_quality": "measured"},
-    {"name": "Alexander Albon", "num": 23, "team": "Williams", "tag": "williams", "fp2": 81.847, "data_quality": "measured"},
-    {"name": "Pierre Gasly", "num": 10, "team": "Alpine", "tag": "alpine", "fp2": 82.167, "data_quality": "measured"},
-    {"name": "Carlos Sainz", "num": 55, "team": "Williams", "tag": "williams", "fp2": 82.253, "data_quality": "measured"},
-    {"name": "Franco Colapinto", "num": 43, "team": "Alpine", "tag": "alpine", "fp2": 82.619, "data_quality": "measured"},
-    {"name": "Valtteri Bottas", "num": 77, "team": "Cadillac", "tag": "cadillac", "fp2": 83.660, "data_quality": "measured"},
-    {"name": "Fernando Alonso", "num": 14, "team": "Aston Martin", "tag": "aston_martin", "fp2": 81.400, "data_quality": "estimated"},
-    {"name": "Lance Stroll", "num": 18, "team": "Aston Martin", "tag": "aston_martin", "fp2": 81.800, "data_quality": "estimated"},
-    {"name": "Sergio Perez", "num": 11, "team": "Cadillac", "tag": "cadillac", "fp2": 84.120, "data_quality": "estimated"},
+    {"name": "Oscar Piastri", "num": 81, "team": "McLaren", "tag": "mclaren", "fp1": 81.342, "fp2": 79.729, "fp3": 80.087, "data_quality": "measured"},
+    {"name": "Kimi Antonelli", "num": 12, "team": "Mercedes", "tag": "mercedes", "fp1": 81.376, "fp2": 79.943, "fp3": 80.324, "data_quality": "measured"},
+    {"name": "George Russell", "num": 63, "team": "Mercedes", "tag": "mercedes", "fp1": 81.371, "fp2": 80.049, "fp3": 79.053, "data_quality": "measured"},
+    {"name": "Lewis Hamilton", "num": 44, "team": "Ferrari", "tag": "ferrari", "fp1": 80.736, "fp2": 80.050, "fp3": 79.669, "data_quality": "measured"},
+    {"name": "Charles Leclerc", "num": 16, "team": "Ferrari", "tag": "ferrari", "fp1": 80.267, "fp2": 80.291, "fp3": 79.827, "data_quality": "measured"},
+    {"name": "Max Verstappen", "num": 3, "team": "Red Bull Racing", "tag": "red_bull", "fp1": 80.789, "fp2": 80.366, "fp3": 80.197, "data_quality": "measured"},
+    {"name": "Lando Norris", "num": 1, "team": "McLaren", "tag": "mclaren", "fp1": 84.391, "fp2": 80.794, "fp3": 80.443, "data_quality": "measured"},
+    {"name": "Arvid Lindblad", "num": 41, "team": "Racing Bulls", "tag": "racing_bulls", "fp1": 81.313, "fp2": 80.922, "fp3": 80.838, "data_quality": "measured"},
+    {"name": "Isack Hadjar", "num": 6, "team": "Red Bull Racing", "tag": "red_bull", "fp1": 81.087, "fp2": 80.941, "fp3": 80.137, "data_quality": "measured"},
+    {"name": "Esteban Ocon", "num": 31, "team": "Haas", "tag": "haas", "fp1": 82.161, "fp2": 81.179, "fp3": 80.983, "data_quality": "measured"},
+    {"name": "Oliver Bearman", "num": 87, "team": "Haas", "tag": "haas", "fp1": 82.682, "fp2": 81.326, "fp3": 80.778, "data_quality": "measured"},
+    {"name": "Nico Hulkenberg", "num": 27, "team": "Audi", "tag": "audi", "fp1": 81.969, "fp2": 81.351, "fp3": 81.067, "data_quality": "measured"},
+    {"name": "Liam Lawson", "num": 30, "team": "Racing Bulls", "tag": "racing_bulls", "fp1": 82.613, "fp2": 81.358, "fp3": 80.890, "data_quality": "measured"},
+    {"name": "Gabriel Bortoleto", "num": 5, "team": "Audi", "tag": "audi", "fp1": 81.696, "fp2": 81.668, "fp3": 80.459, "data_quality": "measured"},
+    {"name": "Alexander Albon", "num": 23, "team": "Williams", "tag": "williams", "fp1": 83.130, "fp2": 81.847, "fp3": 81.664, "data_quality": "measured"},
+    {"name": "Pierre Gasly", "num": 10, "team": "Alpine", "tag": "alpine", "fp1": 84.035, "fp2": 82.167, "fp3": 81.071, "data_quality": "measured"},
+    {"name": "Carlos Sainz", "num": 55, "team": "Williams", "tag": "williams", "fp1": 82.323, "fp2": 82.253, "fp3": None, "data_quality": "measured"},
+    {"name": "Franco Colapinto", "num": 43, "team": "Alpine", "tag": "alpine", "fp1": 83.325, "fp2": 82.619, "fp3": 81.413, "data_quality": "measured"},
+    {"name": "Valtteri Bottas", "num": 77, "team": "Cadillac", "tag": "cadillac", "fp1": 84.022, "fp2": 83.660, "fp3": 83.514, "data_quality": "measured"},
+    {"name": "Fernando Alonso", "num": 14, "team": "Aston Martin", "tag": "aston_martin", "fp1": None, "fp2": None, "fp3": 82.720, "data_quality": "estimated"},
+    {"name": "Lance Stroll", "num": 18, "team": "Aston Martin", "tag": "aston_martin", "fp1": None, "fp2": None, "fp3": None, "data_quality": "estimated"},
+    {"name": "Sergio Perez", "num": 11, "team": "Cadillac", "tag": "cadillac", "fp1": 84.620, "fp2": None, "fp3": 84.397, "data_quality": "measured"},
 ]
+
+# Step 1.2b – Session weights for composite baseline (later sessions more representative)
+# FP3 is closest to qualifying/race conditions; FP1 is exploratory
+FP_WEIGHTS = {"fp1": 0.20, "fp2": 0.35, "fp3": 0.45}
+
+
+def compute_composite_baseline(driver: dict) -> float:
+    """Compute a weighted composite baseline from available FP sessions.
+
+    Uses FP_WEIGHTS, skipping sessions with no time and redistributing
+    their weight proportionally. Returns the best single session time
+    if only one is available.
+    """
+    sessions = {}
+    for key in ("fp1", "fp2", "fp3"):
+        t = driver.get(key)
+        if t is not None:
+            sessions[key] = t
+
+    if not sessions:
+        # Fallback for drivers with no FP data — use estimated value
+        return 82.0  # grid-midfield estimate
+
+    if len(sessions) == 1:
+        return next(iter(sessions.values()))
+
+    # Redistribute weights across available sessions
+    total_weight = sum(FP_WEIGHTS[k] for k in sessions)
+    return sum(sessions[k] * FP_WEIGHTS[k] / total_weight for k in sessions)
 
 # Step 1.3 – Team affinities by circuit type
 TEAM_AFFINITIES = {
@@ -164,10 +194,10 @@ TEAM_COLORS = {
 # After the race: GLOBAL_CORRECTION = actual_winner_time_s / projected_winner_time_s
 GLOBAL_CORRECTION = 1.0
 
-# OFFSET_FP2_TO_QUALI: median seconds faster in qualifying vs FP2 across the grid.
+# OFFSET_FP_TO_QUALI: median seconds faster in qualifying vs composite FP across the grid.
 # Set to 0.0 (neutral) until qualifying data is available.
-# After qualifying: compute per-driver (FP2 - quali_best), take median.
-OFFSET_FP2_TO_QUALI = 0.0
+# After qualifying: compute per-driver (composite_fp - quali_best), take median.
+OFFSET_FP_TO_QUALI = 0.0
 
 RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
 SPRINT_POINTS = {1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1}
@@ -827,6 +857,45 @@ def fetch_qualifying_results(conn, circuit_key, year=2026):
         return {}
 
 
+def fetch_qualifying_times(conn, circuit_key, year=2026):
+    """Query f1db for qualifying lap times at the given circuit.
+
+    Returns dict mapping driver_name -> best qualifying time in seconds, or empty dict.
+    """
+    if conn is None:
+        return {}
+    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
+    f1db_circuit = CIRCUIT_F1DB_IDS.get(circuit_key)
+    if f1db_circuit is None:
+        return {}
+    try:
+        rows = conn.execute("""
+            SELECT rd.driver_id, rd.q1, rd.q2, rd.q3
+            FROM race_data rd
+            JOIN race r ON rd.race_id = r.id
+            WHERE rd.type = 'QUALIFYING_RESULT'
+              AND r.year = ? AND r.circuit_id = ?
+        """, (year, f1db_circuit)).fetchall()
+        results = {}
+        for row in rows:
+            driver_name = f1db_to_driver.get(row["driver_id"])
+            if not driver_name:
+                continue
+            best_t = None
+            for col in ("q3", "q2", "q1"):
+                val = row[col] if col in row.keys() else None
+                if val is not None:
+                    t = _parse_quali_time(str(val))
+                    if t is not None:
+                        best_t = t
+                        break
+            if best_t is not None:
+                results[driver_name] = best_t
+        return results
+    except (sqlite3.Error, sqlite3.OperationalError):
+        return {}
+
+
 def compute_auto_calibration(conn, year=2026):
     """Compute GLOBAL_CORRECTION from actual vs projected winner times."""
     if conn is None:
@@ -956,6 +1025,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
         "latest_race": None,
         "season_calendar": [],
         "quali_results": {},
+        "quali_times": {},
         "calibration_correction": 1.0,
         "calibration_races": 0,
     }
@@ -1036,12 +1106,25 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
             f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/qualifying-results.yml")
         if quali_text:
             quali_map = {}
+            quali_times_map = {}
             for entry in _parse_simple_yaml_list(quali_text):
                 dn = f1db_to_driver.get(entry.get("driverId"))
                 if dn and entry.get("position") is not None:
                     quali_map[dn] = entry["position"]
+                # Extract best qualifying time (prefer q3 > q2 > q1)
+                if dn:
+                    best_t = None
+                    for qkey in ("q3", "q2", "q1"):
+                        t = _parse_quali_time(str(entry.get(qkey, "")))
+                        if t is not None:
+                            best_t = t
+                            break
+                    if best_t is not None:
+                        quali_times_map[dn] = best_t
             if quali_map:
                 result["quali_results"][circuit_key] = quali_map
+            if quali_times_map:
+                result["quali_times"][circuit_key] = quali_times_map
 
     # Set latest race (highest completed round)
     if completed:
@@ -1281,17 +1364,17 @@ def format_gap(gap_seconds: float) -> str:
 
 
 # Single-driver lap projection
-def project_lap_time(baseline_fp2: float, target_ratio: float,
+def project_lap_time(baseline: float, target_ratio: float,
                      team_affinity: float = 1.0, correction: float = 1.0) -> float:
-    """Project a driver lap time from Albert Park FP2 baseline to a target circuit.
+    """Project a driver lap time from Albert Park composite baseline to a target circuit.
 
     Args:
-        baseline_fp2: Driver FP2 best lap time in seconds.
+        baseline: Driver composite FP baseline lap time in seconds.
         target_ratio: Circuit lap-time ratio relative to Albert Park.
         team_affinity: Team circuit-type affinity multiplier.
         correction: Global correction factor (1.0 = no correction).
     """
-    return baseline_fp2 * target_ratio * team_affinity * correction
+    return baseline * target_ratio * team_affinity * correction
 
 
 # Full-grid projection for a given circuit - returns projected total race times
@@ -1313,7 +1396,8 @@ def calculate_all_projections(circuit_key: str, historical: dict | None = None,
         affinity = TEAM_AFFINITIES.get(driver["tag"], {}).get(circuit_type, 1.0)
         hist_factor = compute_historical_factor(driver["name"], circuit_key, historical) if historical else 1.0
         dnf_prob = compute_driver_dnf_probability(driver["name"], circuit_key, historical)
-        projected_lap = project_lap_time(driver["fp2"], target_ratio, affinity, GLOBAL_CORRECTION) * hist_factor
+        baseline = compute_composite_baseline(driver)
+        projected_lap = project_lap_time(baseline, target_ratio, affinity, GLOBAL_CORRECTION) * hist_factor
         total_race = projected_lap * race_laps
         results.append({
             "driver": driver["name"],
@@ -1381,6 +1465,104 @@ def calculate_all_projections(circuit_key: str, historical: dict | None = None,
     for i, r in enumerate(results):
         ep = exp_pts_list[i]
         # E[Pts] = position-uncertainty-adjusted points × probability of finishing
+        r["exp_pts"] = round(ep["exp_pts"] * (1.0 - r["dnf_prob"]), 2)
+        r["pos_low"] = ep["pos_low"]
+        r["pos_high"] = ep["pos_high"]
+        r["dnf_pct"] = f"{r['dnf_prob'] * 100:.0f}%"
+
+    return results
+
+
+def _parse_quali_time(time_str: str) -> float | None:
+    """Parse a qualifying time string like '1:18.518' to seconds."""
+    if not time_str:
+        return None
+    parts = time_str.split(':')
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(parts[0])
+    except (ValueError, TypeError):
+        return None
+
+
+def calculate_qualifying_projections(circuit_key: str,
+                                     quali_positions: dict,
+                                     quali_times: dict | None = None,
+                                     historical: dict | None = None) -> list[dict]:
+    """Calculate projected race outcome based on qualifying results and historical data.
+
+    In qualifying mode, the grid order is primary. If qualifying lap times
+    are available, they're used to project race times scaled by the circuit's
+    lap count and a quali-to-race degradation factor. Otherwise, the practice
+    composite baseline is used but ordered by qualifying position.
+    """
+    circuit = CIRCUITS_2026[circuit_key]
+    target_ratio = circuit["ratio"]
+    circuit_type = circuit["type"]
+    race_laps = circuit["laps"]
+    overtaking = CIRCUIT_OVERTAKING.get(circuit_key, 0.50)
+
+    # Albert Park qualifying baseline ratio (quali times are faster than race pace)
+    # Typical race lap is ~5-7% slower than qualifying lap
+    QUALI_TO_RACE_FACTOR = 1.06
+
+    results = []
+    driver_lookup = {d["name"]: d for d in DRIVERS_2026}
+
+    for driver in DRIVERS_2026:
+        quali_pos = quali_positions.get(driver["name"])
+        hist_factor = (compute_historical_factor(driver["name"], circuit_key, historical)
+                       if historical else 1.0)
+        dnf_prob = compute_driver_dnf_probability(driver["name"], circuit_key, historical)
+        affinity = TEAM_AFFINITIES.get(driver["tag"], {}).get(circuit_type, 1.0)
+
+        # Determine lap time baseline
+        q_time = (quali_times or {}).get(driver["name"])
+        if q_time is not None:
+            # Use actual qualifying time, scaled to race pace
+            projected_lap = q_time * QUALI_TO_RACE_FACTOR * affinity * GLOBAL_CORRECTION * hist_factor
+        else:
+            # Fallback to practice composite
+            baseline = compute_composite_baseline(driver)
+            projected_lap = project_lap_time(baseline, target_ratio, affinity, GLOBAL_CORRECTION) * hist_factor
+
+        total_race = projected_lap * race_laps
+
+        results.append({
+            "driver": driver["name"],
+            "num": driver["num"],
+            "team": driver["team"],
+            "tag": driver["tag"],
+            "data_quality": driver.get("data_quality", "measured"),
+            "time_s": total_race,
+            "time_str": format_race_time(total_race),
+            "lap_s": projected_lap,
+            "lap_str": format_lap_time(projected_lap),
+            "hist_factor": hist_factor,
+            "dnf_prob": dnf_prob,
+            "quali_pos": quali_pos,
+        })
+
+    # Sort by qualifying position (drivers without a quali position go to the back)
+    results.sort(key=lambda r: (r["quali_pos"] if r["quali_pos"] is not None else 99,
+                                r["time_s"]))
+
+    leader_time = results[0]["time_s"]
+    for r in results:
+        r["gap"] = round(r["time_s"] - leader_time, 3)
+        r["gap_str"] = format_gap(r["gap"])
+
+    for i, r in enumerate(results):
+        r["proj_pts"] = RACE_POINTS.get(i + 1, 0)
+
+    for r in results:
+        r["quali_mode"] = True
+
+    # Compute expected points using overtaking difficulty and DNF probability
+    exp_pts_list = calculate_expected_points(results, overtaking)
+    for i, r in enumerate(results):
+        ep = exp_pts_list[i]
         r["exp_pts"] = round(ep["exp_pts"] * (1.0 - r["dnf_prob"]), 2)
         r["pos_low"] = ep["pos_low"]
         r["pos_high"] = ep["pos_high"]
@@ -1466,8 +1648,10 @@ class F1ProjectionApp(tk.Tk):
         self.rowconfigure(1, weight=0)  # Selector
         self.rowconfigure(2, weight=1)  # Table
         self.rowconfigure(3, weight=0)  # Footer
-        self.rowconfigure(4, weight=0)  # Standings
-        self.rowconfigure(5, weight=0)  # Championship projection
+        self.rowconfigure(4, weight=0)  # Standings toggle
+        self.rowconfigure(5, weight=0)  # Standings content
+        self.rowconfigure(6, weight=0)  # Championship toggle
+        self.rowconfigure(7, weight=0)  # Championship content
 
         # Phase 3 instance variables
         self.latest_race = None
@@ -1478,6 +1662,10 @@ class F1ProjectionApp(tk.Tk):
 
         self.historical_data = None
         self.quali_results = {}  # circuit_key -> {driver_name: position}
+        self.quali_times = {}    # circuit_key -> {driver_name: best_q_time_seconds}
+
+        # Track collapsible section state
+        self._collapsed = {}  # section_name -> bool
 
         self._configure_styles()
         self._build_header()
@@ -1524,7 +1712,7 @@ class F1ProjectionApp(tk.Tk):
         frame = ttk.Frame(self, padding=(20, 15, 20, 5))
         frame.grid(row=0, column=0, sticky="ew")
         ttk.Label(frame, text="F1 2026 RACE TIME PROJECTIONS", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="Based on Australian GP FP2 data · Historical: f1nsight-api-2 · Latest: f1db",
+        ttk.Label(frame, text="Based on Australian GP FP1/FP2/FP3 data (weighted composite) · Historical: f1nsight-api-2 · Latest: f1db",
                   style="Sub.TLabel").pack(anchor="w")
         self.status_label = ttk.Label(frame, text="", style="Sub.TLabel")
         self.status_label.pack(anchor="w")
@@ -1545,6 +1733,13 @@ class F1ProjectionApp(tk.Tk):
         self.circuit_combo = ttk.Combobox(frame, values=circuit_names, state="readonly", width=30)
         self.circuit_combo.pack(side="left", padx=(0, 15))
         self.circuit_combo.bind("<<ComboboxSelected>>", lambda e: self.on_circuit_selected())
+
+        ttk.Label(frame, text="Mode:").pack(side="left", padx=(0, 5))
+        self.mode_combo = ttk.Combobox(frame, values=["Practice", "Qualifying"],
+                                        state="readonly", width=12)
+        self.mode_combo.current(0)
+        self.mode_combo.pack(side="left", padx=(0, 15))
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda e: self.on_circuit_selected())
 
         self.circuit_info = ttk.Label(frame, text="", style="Sub.TLabel")
         self.circuit_info.pack(side="left")
@@ -1642,6 +1837,9 @@ class F1ProjectionApp(tk.Tk):
                     quali = fetch_qualifying_results(conn, circuit_key)
                     if quali:
                         self.quali_results[circuit_key] = quali
+                    qt = fetch_qualifying_times(conn, circuit_key)
+                    if qt:
+                        self.quali_times[circuit_key] = qt
             finally:
                 conn.close()
 
@@ -1663,6 +1861,9 @@ class F1ProjectionApp(tk.Tk):
                 for ck, qr in raw.get("quali_results", {}).items():
                     if ck not in self.quali_results:
                         self.quali_results[ck] = qr
+                for ck, qt in raw.get("quali_times", {}).items():
+                    if ck not in self.quali_times:
+                        self.quali_times[ck] = qt
                 if raw.get("calibration_races", 0) > 0:
                     GLOBAL_CORRECTION = raw["calibration_correction"]
                     self.calibration_races = raw["calibration_races"]
@@ -1704,14 +1905,39 @@ class F1ProjectionApp(tk.Tk):
         if hasattr(self, "status_label"):
             self.status_label.configure(text=text)
 
+    def _toggle_section(self, section_name, content_frame, toggle_btn):
+        """Toggle visibility of a collapsible section."""
+        collapsed = self._collapsed.get(section_name, False)
+        if collapsed:
+            content_frame.grid()
+            toggle_btn.configure(text="\u25BC")
+            self._collapsed[section_name] = False
+        else:
+            content_frame.grid_remove()
+            toggle_btn.configure(text="\u25B6")
+            self._collapsed[section_name] = True
+
     def _build_standings(self):
-        frame = ttk.Frame(self, padding=(20, 5, 20, 10))
-        frame.grid(row=4, column=0, sticky="ew")
-        frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
+        # Header bar with toggle button
+        header_frame = ttk.Frame(self, padding=(20, 5, 20, 0))
+        header_frame.grid(row=4, column=0, sticky="ew")
+        self._standings_toggle = tk.Button(
+            header_frame, text="\u25BC", command=lambda: self._toggle_section(
+                "standings", self._standings_content, self._standings_toggle),
+            bg="#15151E", fg="#E10600", bd=0, font=("Segoe UI", 10, "bold"),
+            activebackground="#15151E", activeforeground="#FFFFFF", cursor="hand2")
+        self._standings_toggle.pack(side="left")
+        ttk.Label(header_frame, text=" Current Standings", style="Sub.TLabel",
+                  font=("Segoe UI", 11, "bold"), foreground="#E10600").pack(side="left")
+
+        # Collapsible content
+        self._standings_content = ttk.Frame(self, padding=(20, 0, 20, 10))
+        self._standings_content.grid(row=5, column=0, sticky="ew")
+        self._standings_content.columnconfigure(0, weight=1)
+        self._standings_content.columnconfigure(1, weight=1)
 
         # Driver standings
-        self.driver_standings_frame = ttk.LabelFrame(frame, text="Driver Championship",
+        self.driver_standings_frame = ttk.LabelFrame(self._standings_content, text="Driver Championship",
                                                       padding=(10, 5))
         self.driver_standings_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
@@ -1722,7 +1948,7 @@ class F1ProjectionApp(tk.Tk):
         self.driver_no_data.pack(anchor="w")
 
         # Constructor standings
-        self.constructor_standings_frame = ttk.LabelFrame(frame, text="Constructor Championship",
+        self.constructor_standings_frame = ttk.LabelFrame(self._standings_content, text="Constructor Championship",
                                                            padding=(10, 5))
         self.constructor_standings_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
@@ -1734,10 +1960,24 @@ class F1ProjectionApp(tk.Tk):
 
     def _build_championship_projection(self):
         """Build the projected season championship panel."""
-        frame = ttk.LabelFrame(self, text="Projected Season Championship (E[Pts] across all circuits)",
-                                padding=(10, 5))
-        frame.grid(row=5, column=0, sticky="ew", padx=20, pady=(5, 10))
-        frame.columnconfigure(0, weight=1)
+        # Header bar with toggle button
+        champ_header = ttk.Frame(self, padding=(20, 5, 20, 0))
+        champ_header.grid(row=6, column=0, sticky="ew")
+        self._champ_toggle = tk.Button(
+            champ_header, text="\u25BC", command=lambda: self._toggle_section(
+                "championship", self._champ_content, self._champ_toggle),
+            bg="#15151E", fg="#E10600", bd=0, font=("Segoe UI", 10, "bold"),
+            activebackground="#15151E", activeforeground="#FFFFFF", cursor="hand2")
+        self._champ_toggle.pack(side="left")
+        ttk.Label(champ_header, text=" Projected Season Championship", style="Sub.TLabel",
+                  font=("Segoe UI", 11, "bold"), foreground="#E10600").pack(side="left")
+
+        # Collapsible content
+        self._champ_content = ttk.LabelFrame(self, text="E[Pts] across all circuits",
+                                              padding=(10, 5))
+        self._champ_content.grid(row=7, column=0, sticky="ew", padx=20, pady=(0, 10))
+        self._champ_content.columnconfigure(0, weight=1)
+        frame = self._champ_content
 
         self.champ_tree = ttk.Treeview(
             frame,
@@ -1883,6 +2123,7 @@ class F1ProjectionApp(tk.Tk):
     def on_circuit_selected(self, event=None):
         circuit_key = self._get_selected_circuit_key()
         circuit = CIRCUITS_2026[circuit_key]
+        mode = self.mode_combo.get()  # "Practice" or "Qualifying"
 
         # Update info label
         overtaking = CIRCUIT_OVERTAKING.get(circuit_key, 0.50)
@@ -1891,14 +2132,22 @@ class F1ProjectionApp(tk.Tk):
                     "Medium" if overtaking <= 0.55 else
                     "Easy" if overtaking <= 0.75 else "Very Easy")
 
-        # Calculate projections with qualifying data if available
         quali = self.quali_results.get(circuit_key, {})
-        projections = calculate_all_projections(circuit_key, self.historical_data, quali or None)
+        quali_times = self.quali_times.get(circuit_key, {})
 
-        # Update circuit info with mode
-        mode_text = "FP2 + Qualifying (60/40)" if quali else "FP2 only"
+        if mode == "Qualifying" and quali:
+            projections = calculate_qualifying_projections(
+                circuit_key, quali, quali_times, self.historical_data)
+            mode_text = "Qualifying + Historical"
+        else:
+            projections = calculate_all_projections(
+                circuit_key, self.historical_data, quali or None)
+            mode_text = "Practice (FP1/2/3) + Historical"
+            if mode == "Qualifying" and not quali:
+                mode_text += " (no qualifying data yet)"
+
         self.circuit_info.configure(
-            text=f"{circuit['location']} · {circuit['km']} km · {circuit['turns']} turns · {circuit['laps']} laps · {circuit['type'].title()} · Overtaking: {ot_label} ({overtaking:.0%}) · Mode: {mode_text}"
+            text=f"{circuit['location']} · {circuit['km']} km · {circuit['turns']} turns · {circuit['laps']} laps · {circuit['type'].title()} · Overtaking: {ot_label} ({overtaking:.0%}) · {mode_text}"
         )
 
         # Clear and repopulate table
