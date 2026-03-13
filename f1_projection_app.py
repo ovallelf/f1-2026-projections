@@ -2009,7 +2009,7 @@ class F1ProjectionApp(tk.Tk):
         self.circuit_combo.bind("<<ComboboxSelected>>", lambda e: self.on_circuit_selected())
 
         ttk.Label(frame, text="Mode:").pack(side="left", padx=(0, 5))
-        self.mode_combo = ttk.Combobox(frame, values=["Practice", "Qualifying", "Sprint"],
+        self.mode_combo = ttk.Combobox(frame, values=["Grand Prix", "Grand Prix +Q", "Sprint"],
                                         state="readonly", width=12)
         self.mode_combo.current(0)
         self.mode_combo.pack(side="left", padx=(0, 15))
@@ -2443,7 +2443,7 @@ class F1ProjectionApp(tk.Tk):
         circuit_key = self._get_selected_circuit_key()
         self._update_session_status(circuit_key)
         circuit = CIRCUITS_2026[circuit_key]
-        mode = self.mode_combo.get()  # "Practice" or "Qualifying"
+        mode = self.mode_combo.get()  # "Grand Prix", "Grand Prix +Q", or "Sprint"
 
         # Update info label
         overtaking = CIRCUIT_OVERTAKING.get(circuit_key, 0.50)
@@ -2468,16 +2468,16 @@ class F1ProjectionApp(tk.Tk):
             else:
                 projections = calculate_all_projections(
                     circuit_key, self.historical_data, quali or None)
-                mode_text = "No sprint race at this circuit — showing Practice projection"
-        elif mode == "Qualifying" and quali:
+                mode_text = "No sprint race at this circuit — showing Grand Prix projection"
+        elif mode == "Grand Prix +Q" and quali:
             projections = calculate_qualifying_projections(
                 circuit_key, quali, quali_times, self.historical_data)
-            mode_text = "Qualifying + Historical"
+            mode_text = "Grand Prix +Q (FP1/2/3 + Qualifying) + Historical"
         else:
             projections = calculate_all_projections(
                 circuit_key, self.historical_data, quali or None)
-            mode_text = "Practice (FP1/2/3) + Historical"
-            if mode == "Qualifying" and not quali:
+            mode_text = "Grand Prix (FP1/2/3) + Historical"
+            if mode == "Grand Prix +Q" and not quali:
                 mode_text += " (no qualifying data yet)"
 
         self.circuit_info.configure(
@@ -2485,6 +2485,8 @@ class F1ProjectionApp(tk.Tk):
         )
 
         # Clear and repopulate table
+        if mode == "Sprint" and circuit_key in SPRINT_CIRCUITS:
+            projections = projections[:10]
         for item in self.tree.get_children():
             self.tree.delete(item)
 
