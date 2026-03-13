@@ -193,6 +193,7 @@ TEAM_COLORS = {
 # Set to 1.0 (neutral) until Round 1 race data is available.
 # After the race: GLOBAL_CORRECTION = actual_winner_time_s / projected_winner_time_s
 GLOBAL_CORRECTION = 1.0
+_GC_LOCK = threading.Lock()  # Protects GLOBAL_CORRECTION read/write (MAJ-01)
 
 # OFFSET_FP_TO_QUALI: median seconds faster in qualifying vs composite FP across the grid.
 # Set to 0.0 (neutral) until qualifying data is available.
@@ -213,6 +214,16 @@ SPRINT_CIRCUITS = {
 
 SQ_TO_SPRINT_FACTOR = 1.03   # Sprint qualifying → sprint race pace (~3% degradation)
 SPRINT_DNF_FACTOR = 0.50     # Sprint DNF probability = 50% of race DNF
+
+SESSION_TYPE_MAP = {
+    "FP1": "FREE_PRACTICE_1_RESULT",
+    "FP2": "FREE_PRACTICE_2_RESULT",
+    "FP3": "FREE_PRACTICE_3_RESULT",
+    "SQ":  "SPRINT_QUALIFYING_RESULT",
+    "Sprint": "SPRINT_RACE_RESULT",
+    "Q":   "QUALIFYING_RESULT",
+    "Race": "RACE_RESULT",
+}
 
 # ---------------------------------------------------------------------------
 # F1DB Integration Constants (latest / current-season data)
@@ -272,7 +283,9 @@ def download_f1db(progress_callback=None):
     if progress_callback:
         progress_callback("Downloading f1db database...")
 
-    urllib.request.urlretrieve(F1DB_SQLITE_URL, zip_path)
+    # Use urlopen with timeout instead of urlretrieve to avoid hanging indefinitely
+    with urllib.request.urlopen(F1DB_SQLITE_URL, timeout=60) as resp, open(zip_path, "wb") as out:
+        out.write(resp.read())
 
     if progress_callback:
         progress_callback("Extracting database...")
@@ -438,6 +451,10 @@ CIRCUIT_F1DB_IDS = {
     "lusail": "lusail",
     "yas_marina": "yas-marina",
 }
+
+# Reverse lookups — built once at module level (MAJ-02)
+_F1DB_TO_DRIVER = {v: k for k, v in DRIVER_F1DB_IDS.items()}
+_F1DB_TO_CIRCUIT = {v: k for k, v in CIRCUIT_F1DB_IDS.items()}
 
 CONSTRUCTOR_F1DB_IDS = {
     "mclaren": ["mclaren"],
@@ -667,8 +684,6 @@ def build_historical_data_f1db(conn):
     if conn is None:
         return {}
 
-    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
-    f1db_to_circuit = {v: k for k, v in CIRCUIT_F1DB_IDS.items()}
     historical = {}
 
     try:
@@ -684,8 +699,8 @@ def build_historical_data_f1db(conn):
         ).fetchall()
 
         for row in rows:
-            driver_name = f1db_to_driver.get(row["driver_id"])
-            circuit_key = f1db_to_circuit.get(row["circuit_id"])
+            driver_name = _F1DB_TO_DRIVER.get(row["driver_id"])
+            circuit_key = _F1DB_TO_CIRCUIT.get(row["circuit_id"])
             if not driver_name or not circuit_key:
                 continue
             if driver_name not in historical:
@@ -721,7 +736,6 @@ def fetch_current_standings(conn, year=2026):
     """Query f1db for current driver and constructor championship standings."""
     if conn is None:
         return [], []
-    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
     try:
         latest_race = conn.execute("""
             SELECT MAX(r.id) FROM race r
@@ -738,7 +752,7 @@ def fetch_current_standings(conn, year=2026):
         """, (latest_race,)).fetchall()
         driver_standings = []
         for row in driver_rows:
-            name = f1db_to_driver.get(row["driver_id"], row["driver_id"])
+            name = _F1DB_TO_DRIVER.get(row["driver_id"], row["driver_id"])
             driver_standings.append({
                 "position": row["position_number"],
                 "driver": name,
@@ -767,7 +781,6 @@ def fetch_latest_race_result(conn, year=2026):
     """Query f1db for the most recent completed race result."""
     if conn is None:
         return None
-    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
     try:
         race_info = conn.execute("""
             SELECT r.id, r.round, r.date, r.grand_prix_id, r.circuit_id
@@ -788,7 +801,7 @@ def fetch_latest_race_result(conn, year=2026):
         """, (race_id,)).fetchall()
         results = []
         for row in rows:
-            name = f1db_to_driver.get(row["driver_id"], row["driver_id"])
+            name = _F1DB_TO_DRIVER.get(row["driver_id"], row["driver_id"])
             results.append({
                 "position": row["position_number"],
                 "driver": name,
@@ -839,6 +852,33 @@ def fetch_season_calendar(conn, year=2026):
         return []
 
 
+def fetch_session_completion(conn, year=2026):
+    """Query f1db for completed session types per circuit."""
+    if conn is None:
+        return {}
+    try:
+        rows = conn.execute("""
+            SELECT r.circuit_id, rd.type
+            FROM race_data rd
+            JOIN race r ON rd.race_id = r.id
+            WHERE r.year = ? AND rd.type IN (
+                'FREE_PRACTICE_1_RESULT', 'FREE_PRACTICE_2_RESULT',
+                'FREE_PRACTICE_3_RESULT', 'QUALIFYING_RESULT',
+                'SPRINT_QUALIFYING_RESULT', 'SPRINT_RACE_RESULT',
+                'RACE_RESULT'
+            )
+            GROUP BY r.circuit_id, rd.type
+        """, (year,)).fetchall()
+        result = {}
+        for row in rows:
+            circuit_key = _F1DB_TO_CIRCUIT.get(row["circuit_id"])
+            if circuit_key:
+                result.setdefault(circuit_key, set()).add(row["type"])
+        return result
+    except sqlite3.Error:
+        return {}
+
+
 def fetch_qualifying_results(conn, circuit_key, year=2026):
     """Query f1db for qualifying results at the given circuit in the current season.
 
@@ -846,7 +886,6 @@ def fetch_qualifying_results(conn, circuit_key, year=2026):
     """
     if conn is None:
         return {}
-    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
     f1db_circuit = CIRCUIT_F1DB_IDS.get(circuit_key)
     if f1db_circuit is None:
         return {}
@@ -861,7 +900,7 @@ def fetch_qualifying_results(conn, circuit_key, year=2026):
         """, (year, f1db_circuit)).fetchall()
         results = {}
         for row in rows:
-            driver_name = f1db_to_driver.get(row["driver_id"])
+            driver_name = _F1DB_TO_DRIVER.get(row["driver_id"])
             if driver_name:
                 results[driver_name] = row["position_number"]
         return results
@@ -876,7 +915,6 @@ def fetch_qualifying_times(conn, circuit_key, year=2026):
     """
     if conn is None:
         return {}
-    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
     f1db_circuit = CIRCUIT_F1DB_IDS.get(circuit_key)
     if f1db_circuit is None:
         return {}
@@ -890,7 +928,7 @@ def fetch_qualifying_times(conn, circuit_key, year=2026):
         """, (year, f1db_circuit)).fetchall()
         results = {}
         for row in rows:
-            driver_name = f1db_to_driver.get(row["driver_id"])
+            driver_name = _F1DB_TO_DRIVER.get(row["driver_id"])
             if not driver_name:
                 continue
             best_t = None
@@ -912,7 +950,6 @@ def fetch_sprint_qualifying_results(conn, circuit_key, year=2026):
     """Fetch sprint qualifying grid positions from f1db SQLite."""
     if conn is None:
         return {}
-    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
     f1db_circuit = CIRCUIT_F1DB_IDS.get(circuit_key)
     if f1db_circuit is None:
         return {}
@@ -927,7 +964,7 @@ def fetch_sprint_qualifying_results(conn, circuit_key, year=2026):
         """, (year, f1db_circuit)).fetchall()
         results = {}
         for row in rows:
-            driver_name = f1db_to_driver.get(row["driver_id"])
+            driver_name = _F1DB_TO_DRIVER.get(row["driver_id"])
             if driver_name:
                 results[driver_name] = row["position_number"]
         return results
@@ -936,10 +973,13 @@ def fetch_sprint_qualifying_results(conn, circuit_key, year=2026):
 
 
 def fetch_sprint_qualifying_times(conn, circuit_key, year=2026):
-    """Fetch best sprint qualifying lap times from f1db SQLite."""
+    """Fetch best sprint qualifying lap times from f1db SQLite.
+
+    Note: f1db reuses q1/q2/q3 columns for sprint qualifying data,
+    differentiated by type='SPRINT_QUALIFYING_RESULT' in race_data.
+    """
     if conn is None:
         return {}
-    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
     f1db_circuit = CIRCUIT_F1DB_IDS.get(circuit_key)
     if f1db_circuit is None:
         return {}
@@ -953,7 +993,7 @@ def fetch_sprint_qualifying_times(conn, circuit_key, year=2026):
         """, (year, f1db_circuit)).fetchall()
         results = {}
         for row in rows:
-            driver_name = f1db_to_driver.get(row["driver_id"])
+            driver_name = _F1DB_TO_DRIVER.get(row["driver_id"])
             if not driver_name:
                 continue
             best_t = None
@@ -975,7 +1015,6 @@ def compute_auto_calibration(conn, year=2026):
     """Compute GLOBAL_CORRECTION from actual vs projected winner times."""
     if conn is None:
         return 1.0, 0
-    f1db_to_circuit = {v: k for k, v in CIRCUIT_F1DB_IDS.items()}
     try:
         rows = conn.execute("""
             SELECT r.circuit_id, rd.race_time_millis
@@ -989,11 +1028,12 @@ def compute_auto_calibration(conn, year=2026):
             return 1.0, 0
         # Save and reset GLOBAL_CORRECTION to avoid recursive distortion (V-02)
         global GLOBAL_CORRECTION
-        saved_gc = GLOBAL_CORRECTION
-        GLOBAL_CORRECTION = 1.0
+        with _GC_LOCK:
+            saved_gc = GLOBAL_CORRECTION
+            GLOBAL_CORRECTION = 1.0
         ratios = []
         for row in rows:
-            circuit_key = f1db_to_circuit.get(row["circuit_id"])
+            circuit_key = _F1DB_TO_CIRCUIT.get(row["circuit_id"])
             if circuit_key is None:
                 continue
             actual_seconds = row["race_time_millis"] / 1000.0
@@ -1004,7 +1044,8 @@ def compute_auto_calibration(conn, year=2026):
             if projected_seconds > 0:
                 ratios.append(actual_seconds / projected_seconds)
         # Restore GLOBAL_CORRECTION before returning
-        GLOBAL_CORRECTION = saved_gc
+        with _GC_LOCK:
+            GLOBAL_CORRECTION = saved_gc
         if not ratios:
             return 1.0, 0
         avg_ratio = sum(ratios) / len(ratios)
@@ -1093,7 +1134,6 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
     Used as fallback when the f1db SQLite release is not yet updated with
     recent race results.
     """
-    f1db_to_driver = {v: k for k, v in DRIVER_F1DB_IDS.items()}
     result = {
         "driver_standings": [],
         "constructor_standings": [],
@@ -1103,6 +1143,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
         "quali_times": {},
         "sprint_quali_results": {},
         "sprint_quali_times": {},
+        "session_completion": {},
         "calibration_correction": 1.0,
         "calibration_races": 0,
     }
@@ -1113,7 +1154,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
     ds_text = _fetch_raw_text(f"{F1DB_RAW_BASE_URL}/{year}/driver-standings.yml")
     if ds_text:
         for entry in _parse_simple_yaml_list(ds_text):
-            driver_name = f1db_to_driver.get(
+            driver_name = _F1DB_TO_DRIVER.get(
                 entry.get("driverId"), entry.get("driverId", ""))
             result["driver_standings"].append({
                 "position": entry.get("position"),
@@ -1152,7 +1193,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
         race_results = []
         winner_time_ms = None
         for entry in entries:
-            driver_name = f1db_to_driver.get(
+            driver_name = _F1DB_TO_DRIVER.get(
                 entry.get("driverId"), entry.get("driverId", ""))
             time_str = entry.get("time")
             time_ms = _parse_race_time_to_ms(time_str) if time_str else None
@@ -1185,7 +1226,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
             quali_map = {}
             quali_times_map = {}
             for entry in _parse_simple_yaml_list(quali_text):
-                dn = f1db_to_driver.get(entry.get("driverId"))
+                dn = _F1DB_TO_DRIVER.get(entry.get("driverId"))
                 if dn and entry.get("position") is not None:
                     quali_map[dn] = entry["position"]
                 # Extract best qualifying time (prefer q3 > q2 > q1)
@@ -1211,7 +1252,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
                 sq_map = {}
                 sq_times_map = {}
                 for entry in _parse_simple_yaml_list(sq_text):
-                    dn = f1db_to_driver.get(entry.get("driverId"))
+                    dn = _F1DB_TO_DRIVER.get(entry.get("driverId"))
                     if dn and entry.get("position") is not None:
                         sq_map[dn] = entry["position"]
                     if dn:
@@ -1227,6 +1268,36 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
                     result["sprint_quali_results"][circuit_key] = sq_map
                 if sq_times_map:
                     result["sprint_quali_times"][circuit_key] = sq_times_map
+
+        # Probe session completion for this completed round
+        session_types = set()
+        session_types.add("RACE_RESULT")  # race_text was non-None to reach here
+        if quali_text:
+            session_types.add("QUALIFYING_RESULT")
+        if circuit_key in SPRINT_CIRCUITS and circuit_key in result["sprint_quali_results"]:
+            session_types.add("SPRINT_QUALIFYING_RESULT")
+
+        fp1_text = _fetch_raw_text(
+            f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/free-practice-1-results.yml")
+        if fp1_text:
+            session_types.add("FREE_PRACTICE_1_RESULT")
+
+        if circuit_key not in SPRINT_CIRCUITS:
+            fp2_text = _fetch_raw_text(
+                f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/free-practice-2-results.yml")
+            if fp2_text:
+                session_types.add("FREE_PRACTICE_2_RESULT")
+            fp3_text = _fetch_raw_text(
+                f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/free-practice-3-results.yml")
+            if fp3_text:
+                session_types.add("FREE_PRACTICE_3_RESULT")
+        else:
+            sr_text = _fetch_raw_text(
+                f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/sprint-race-results.yml")
+            if sr_text:
+                session_types.add("SPRINT_RACE_RESULT")
+
+        result["session_completion"][circuit_key] = session_types
 
     # Set latest race (highest completed round)
     if completed:
@@ -1248,8 +1319,9 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
     # Compute auto-calibration from completed race winner times
     if completed:
         global GLOBAL_CORRECTION
-        saved_gc = GLOBAL_CORRECTION
-        GLOBAL_CORRECTION = 1.0
+        with _GC_LOCK:
+            saved_gc = GLOBAL_CORRECTION
+            GLOBAL_CORRECTION = 1.0
         ratios = []
         for circuit_key, race_data in completed.items():
             if race_data.get("winner_time_ms") is None:
@@ -1261,7 +1333,8 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
             projected_seconds = projections[0]["time_s"]
             if projected_seconds > 0:
                 ratios.append(actual_seconds / projected_seconds)
-        GLOBAL_CORRECTION = saved_gc
+        with _GC_LOCK:
+            GLOBAL_CORRECTION = saved_gc
         if ratios:
             result["calibration_correction"] = round(
                 sum(ratios) / len(ratios), 6)
@@ -1366,7 +1439,8 @@ def calculate_expected_points(projections, overtaking_factor, points_table=None)
         points_table: Points dict mapping position to points (default: RACE_POINTS).
 
     Returns:
-        List of expected points values (same order as projections).
+        List of dicts with keys 'exp_pts', 'pos_low', 'pos_high'
+        (same order as projections).
     """
     if points_table is None:
         points_table = RACE_POINTS
@@ -1859,6 +1933,7 @@ class F1ProjectionApp(tk.Tk):
         self.quali_times = {}    # circuit_key -> {driver_name: best_q_time_seconds}
         self.sprint_quali_results = {}  # circuit_key -> {driver_name: sq_position}
         self.sprint_quali_times = {}    # circuit_key -> {driver_name: best_sq_time_seconds}
+        self.session_completion = {}  # circuit_key -> set of completed session type strings
 
         # Track collapsible section state
         self._collapsed = {}  # section_name -> bool
@@ -1920,8 +1995,11 @@ class F1ProjectionApp(tk.Tk):
         self.calibration_label.pack(anchor="w")
 
     def _build_selector(self):
-        frame = ttk.Frame(self, padding=(20, 5, 20, 5))
-        frame.grid(row=1, column=0, sticky="ew")
+        outer = ttk.Frame(self, padding=(20, 5, 20, 5))
+        outer.grid(row=1, column=0, sticky="ew")
+
+        frame = ttk.Frame(outer)
+        frame.pack(fill="x")
 
         ttk.Label(frame, text="Select Grand Prix:").pack(side="left", padx=(0, 8))
 
@@ -1945,6 +2023,10 @@ class F1ProjectionApp(tk.Tk):
                                      activeforeground="#FFFFFF", font=("Segoe UI", 10),
                                      relief="flat", padx=10, pady=2)
         self.refresh_btn.pack(side="right")
+
+        self.session_status_label = ttk.Label(outer, text="", style="Sub.TLabel",
+                                               font=("Segoe UI", 9))
+        self.session_status_label.pack(anchor="w", pady=(2, 0))
 
     def _get_selected_circuit_key(self) -> str:
         idx = self.circuit_combo.current()
@@ -1997,8 +2079,8 @@ class F1ProjectionApp(tk.Tk):
             )
             if data:
                 self.historical_data = data
-        except Exception:
-            pass
+        except Exception as exc:
+            self.after(0, self._show_status, f"f1nsight error: {exc}")
 
         if self.historical_data is None:
             # Fallback: try f1db for historical data
@@ -2026,7 +2108,8 @@ class F1ProjectionApp(tk.Tk):
                 correction, races_used = compute_auto_calibration(conn)
                 if races_used > 0:
                     global GLOBAL_CORRECTION
-                    GLOBAL_CORRECTION = correction
+                    with _GC_LOCK:
+                        GLOBAL_CORRECTION = correction
                     self.calibration_races = races_used
                 # Preload qualifying results for all circuits
                 for circuit_key in CIRCUITS_2026:
@@ -2047,6 +2130,8 @@ class F1ProjectionApp(tk.Tk):
                             self.sprint_quali_times[ck] = sq_t
                     except Exception:
                         pass
+                # Session completion data (SQLite)
+                self.session_completion = fetch_session_completion(conn)
             finally:
                 conn.close()
 
@@ -2073,11 +2158,18 @@ class F1ProjectionApp(tk.Tk):
                         self.quali_times[ck] = qt
                 self.sprint_quali_results = raw.get("sprint_quali_results", {})
                 self.sprint_quali_times = raw.get("sprint_quali_times", {})
+                # Merge session completion from raw fallback
+                for ck, types in raw.get("session_completion", {}).items():
+                    if ck not in self.session_completion:
+                        self.session_completion[ck] = types
+                    else:
+                        self.session_completion[ck] |= types
                 if raw.get("calibration_races", 0) > 0:
-                    GLOBAL_CORRECTION = raw["calibration_correction"]
+                    with _GC_LOCK:
+                        GLOBAL_CORRECTION = raw["calibration_correction"]
                     self.calibration_races = raw["calibration_races"]
-            except Exception:
-                pass
+            except Exception as exc:
+                self.after(0, self._show_status, f"Raw data error: {exc}")
 
         self.after(0, self._on_all_data_loaded)
 
@@ -2098,6 +2190,9 @@ class F1ProjectionApp(tk.Tk):
         self._update_standings()
         self._update_latest_race()
         self._update_circuit_selector()
+        # Refresh session status for currently selected circuit
+        if self.circuit_combo.current() >= 0:
+            self._update_session_status(self._get_selected_circuit_key())
         self._update_calibration()
         self._update_championship_projection()
         self._show_status("")
@@ -2329,8 +2424,24 @@ class F1ProjectionApp(tk.Tk):
                 text=f"Calibration: {GLOBAL_CORRECTION:.4f} ({self.calibration_races} race{'s' if self.calibration_races != 1 else ''})"
             )
 
+    def _update_session_status(self, circuit_key):
+        """Update the session status label for the selected circuit."""
+        completed = self.session_completion.get(circuit_key, set())
+        is_sprint = circuit_key in SPRINT_CIRCUITS
+        if is_sprint:
+            sessions = ["FP1", "SQ", "Sprint", "Q", "Race"]
+        else:
+            sessions = ["FP1", "FP2", "FP3", "Q", "Race"]
+        parts = []
+        for label in sessions:
+            db_type = SESSION_TYPE_MAP[label]
+            marker = "\u2713" if db_type in completed else "\u00b7"
+            parts.append(f"{label} {marker}")
+        self.session_status_label.configure(text="  ".join(parts))
+
     def on_circuit_selected(self, event=None):
         circuit_key = self._get_selected_circuit_key()
+        self._update_session_status(circuit_key)
         circuit = CIRCUITS_2026[circuit_key]
         mode = self.mode_combo.get()  # "Practice" or "Qualifying"
 
@@ -2410,7 +2521,11 @@ class F1ProjectionApp(tk.Tk):
     def _sort_by_column(self, col):
         data = [(self.tree.set(item, col), item) for item in self.tree.get_children("")]
         try:
-            data.sort(key=lambda t: float(t[0].replace("+", "").replace("s", "").replace("LEADER", "0")))
+            data.sort(key=lambda t: float(
+                t[0].replace("+", "").replace("s", "")
+                    .replace("LEADER", "0").replace("\u2014", "999")
+                    .replace("P", "").split("-")[0]
+            ))
         except ValueError:
             data.sort(key=lambda t: t[0])
         for index, (_, item) in enumerate(data):
