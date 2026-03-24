@@ -2293,9 +2293,9 @@ class F1ProjectionApp(tk.Tk):
             "pos":       ("Pos",    40,  "center"),
             "driver":    ("Driver", 160, "w"),
             "team":      ("Team",   150, "w"),
-            "actual":    ("Actual", 70,  "center"),
-            "projected": ("Proj",   70,  "center"),
-            "total":     ("Total",  70,  "center"),
+            "actual":    ("Current Pts", 85,  "center"),
+            "projected": ("Remaining", 80,  "center"),
+            "total":     ("Est. Final", 80,  "center"),
             "races":     ("Races Projected", 110, "center"),
         }
         for cid, (heading, width, anchor) in champ_cols.items():
@@ -2339,6 +2339,7 @@ class F1ProjectionApp(tk.Tk):
         status = f"{completed}/{total_races} races completed \u00b7 {remaining} projected"
         if completed > 0:
             status += f" \u00b7 Using actual points for {completed} race{'s' if completed != 1 else ''}"
+        status += "  |  Current Pts = official standings \u00b7 Remaining = projected future races \u00b7 Est. Final = Current + Remaining"
         self.champ_status.configure(text=status)
 
     def _update_standings(self):
