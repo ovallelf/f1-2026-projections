@@ -1825,17 +1825,6 @@ def format_gap(gap_seconds: float) -> str:
     return f"+{gap_seconds:.3f}s"
 
 
-# Single-driver lap projection (used only by calibration routines)
-def project_lap_time(baseline: float, target_ratio: float,
-                     team_affinity: float = 1.0, correction: float = 1.0) -> float:
-    """Project a driver lap time from Albert Park composite baseline to a target circuit.
-
-    Used only by auto-calibration which compares projected vs actual race times.
-    Normal projections use circuit-specific FP data or REFERENCE_LAP_TIME × ratio.
-    """
-    return baseline * target_ratio * team_affinity * correction
-
-
 # Full-grid projection for a given circuit - returns projected total race times
 def calculate_all_projections(circuit_key: str, historical: dict | None = None,
                               quali_positions: dict | None = None,
@@ -2528,12 +2517,12 @@ class F1ProjectionApp(tk.Tk):
                 if ck not in self.sprint_quali_times:
                     self.sprint_quali_times[ck] = sqt
 
-            csv_race, csv_standings = fetch_csv_race_results(
+            _, csv_standings = fetch_csv_race_results(
                 progress_callback=cb)
             if not self.driver_standings and csv_standings:
                 self.driver_standings = csv_standings
 
-            csv_sprint, csv_sprint_pts = fetch_csv_sprint_results(
+            csv_sprint, _ = fetch_csv_sprint_results(
                 progress_callback=cb)
             for ck in csv_sprint:
                 self.session_completion.setdefault(ck, set()).add(
