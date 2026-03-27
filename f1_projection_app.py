@@ -19,6 +19,8 @@ import tempfile
 import threading
 import time
 import math
+import csv
+import io
 
 # ---------------------------------------------------------------------------
 # Phase 1 – Data Layer
@@ -84,6 +86,10 @@ DRIVERS_2026 = [
 # Step 1.2b – Session weights for composite baseline (later sessions more representative)
 # FP3 is closest to qualifying/race conditions; FP1 is exploratory
 FP_WEIGHTS = {"fp1": 0.20, "fp2": 0.35, "fp3": 0.45}
+
+# Grid-midfield reference lap time at Albert Park (seconds). Used only to derive
+# circuit reference times via ratio for circuits with no live FP data.
+REFERENCE_LAP_TIME = 81.0
 
 
 def compute_composite_baseline(driver: dict) -> float:
@@ -455,6 +461,41 @@ CIRCUIT_F1DB_IDS = {
 # Reverse lookups — built once at module level (MAJ-02)
 _F1DB_TO_DRIVER = {v: k for k, v in DRIVER_F1DB_IDS.items()}
 _F1DB_TO_CIRCUIT = {v: k for k, v in CIRCUIT_F1DB_IDS.items()}
+
+# formula1-datasets CSV cross-reference source
+F1_DATASETS_BASE_URL = "https://raw.githubusercontent.com/toUpperCase78/formula1-datasets/master"
+F1_DATASETS_FILES = {
+    "race_results": "Formula1_{year}Season_RaceResults.csv",
+    "qualifying": "Formula1_{year}Season_QualifyingResults.csv",
+    "sprint_results": "Formula1_{year}Season_SprintResults.csv",
+    "sprint_qualifying": "Formula1_{year}Season_SprintQualifyingResults.csv",
+}
+CSV_TRACK_TO_CIRCUIT_KEY = {
+    "Australia": "albert_park",
+    "China": "shanghai",
+    "Japan": "suzuka",
+    "Bahrain": "bahrain",
+    "Saudi Arabia": "jeddah",
+    "Miami": "miami",
+    "Canada": "montreal",
+    "Monaco": "monaco",
+    "Spain": "barcelona",
+    "Madrid": "madrid",
+    "Austria": "spielberg",
+    "Great Britain": "silverstone",
+    "Belgium": "spa",
+    "Hungary": "hungary",
+    "Netherlands": "zandvoort",
+    "Italy": "monza",
+    "Azerbaijan": "baku",
+    "Singapore": "singapore",
+    "United States": "cota",
+    "Mexico": "mexico",
+    "Brazil": "interlagos",
+    "Las Vegas": "las_vegas",
+    "Qatar": "lusail",
+    "Abu Dhabi": "yas_marina",
+}
 
 CONSTRUCTOR_F1DB_IDS = {
     "mclaren": ["mclaren"],
@@ -1111,6 +1152,179 @@ def _fetch_raw_text(url: str) -> str | None:
         return None
 
 
+def fetch_csv_qualifying(year=2026, progress_callback=None):
+    """Fetch qualifying results from formula1-datasets CSV."""
+    filename = F1_DATASETS_FILES["qualifying"].format(year=year)
+    url = f"{F1_DATASETS_BASE_URL}/{filename}"
+    if progress_callback:
+        progress_callback("Cross-referencing qualifying data (CSV)...")
+    text = _fetch_raw_text(url)
+    if text is None:
+        return {}, {}
+    driver_names = {d["name"] for d in DRIVERS_2026}
+    quali_positions = {}
+    quali_times = {}
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        track = row.get("Track", "").strip()
+        circuit_key = CSV_TRACK_TO_CIRCUIT_KEY.get(track)
+        if not circuit_key:
+            continue
+        driver = row.get("Driver", "").strip()
+        if driver not in driver_names:
+            continue
+        try:
+            pos = int(row.get("Position", "0"))
+        except (ValueError, TypeError):
+            continue
+        quali_positions.setdefault(circuit_key, {})[driver] = pos
+        for qkey in ("Q3", "Q2", "Q1"):
+            t = _parse_quali_time(row.get(qkey, ""))
+            if t is not None:
+                quali_times.setdefault(circuit_key, {})[driver] = t
+                break
+    return quali_positions, quali_times
+
+
+def fetch_csv_sprint_qualifying(year=2026, progress_callback=None):
+    """Fetch sprint qualifying results from formula1-datasets CSV."""
+    filename = F1_DATASETS_FILES["sprint_qualifying"].format(year=year)
+    url = f"{F1_DATASETS_BASE_URL}/{filename}"
+    if progress_callback:
+        progress_callback("Cross-referencing sprint qualifying data (CSV)...")
+    text = _fetch_raw_text(url)
+    if text is None:
+        return {}, {}
+    driver_names = {d["name"] for d in DRIVERS_2026}
+    sq_positions = {}
+    sq_times = {}
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        track = row.get("Track", "").strip()
+        circuit_key = CSV_TRACK_TO_CIRCUIT_KEY.get(track)
+        if not circuit_key or circuit_key not in SPRINT_CIRCUITS:
+            continue
+        driver = row.get("Driver", "").strip()
+        if driver not in driver_names:
+            continue
+        try:
+            pos = int(row.get("Position", "0"))
+        except (ValueError, TypeError):
+            continue
+        sq_positions.setdefault(circuit_key, {})[driver] = pos
+        for qkey in ("Q3", "Q2", "Q1"):
+            t = _parse_quali_time(row.get(qkey, ""))
+            if t is not None:
+                sq_times.setdefault(circuit_key, {})[driver] = t
+                break
+    return sq_positions, sq_times
+
+
+def fetch_csv_race_results(year=2026, progress_callback=None):
+    """Fetch race results from formula1-datasets CSV.
+
+    Returns:
+        race_results: {circuit_key: [{driver, position, points, grid}, ...]}
+        csv_standings: [{driver, points, position}, ...] — cumulative standings
+    """
+    filename = F1_DATASETS_FILES["race_results"].format(year=year)
+    url = f"{F1_DATASETS_BASE_URL}/{filename}"
+    if progress_callback:
+        progress_callback("Cross-referencing race results (CSV)...")
+    text = _fetch_raw_text(url)
+    if text is None:
+        return {}, []
+    driver_names = {d["name"] for d in DRIVERS_2026}
+    race_results = {}
+    points_tally = {}
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        track = row.get("Track", "").strip()
+        circuit_key = CSV_TRACK_TO_CIRCUIT_KEY.get(track)
+        if not circuit_key:
+            continue
+        driver = row.get("Driver", "").strip()
+        if driver not in driver_names:
+            continue
+        try:
+            pos = int(row.get("Position", "0"))
+        except (ValueError, TypeError):
+            pos = None
+        try:
+            pts = int(row.get("Points", "0"))
+        except (ValueError, TypeError):
+            pts = 0
+        try:
+            grid = int(row.get("Starting Grid", "0"))
+        except (ValueError, TypeError):
+            grid = 0
+        race_results.setdefault(circuit_key, []).append({
+            "driver": driver,
+            "position": pos,
+            "points": pts,
+            "grid": grid,
+        })
+        points_tally[driver] = points_tally.get(driver, 0) + pts
+
+    # Build cumulative standings sorted by points descending
+    csv_standings = sorted(
+        [{"driver": d, "points": p} for d, p in points_tally.items()],
+        key=lambda x: x["points"], reverse=True,
+    )
+    for i, entry in enumerate(csv_standings, 1):
+        entry["position"] = i
+
+    return race_results, csv_standings
+
+
+def fetch_csv_sprint_results(year=2026, progress_callback=None):
+    """Fetch sprint results from formula1-datasets CSV.
+
+    Returns:
+        sprint_results: {circuit_key: [{driver, position, points, grid}, ...]}
+        sprint_points: {driver: total_sprint_points}
+    """
+    filename = F1_DATASETS_FILES["sprint_results"].format(year=year)
+    url = f"{F1_DATASETS_BASE_URL}/{filename}"
+    if progress_callback:
+        progress_callback("Cross-referencing sprint results (CSV)...")
+    text = _fetch_raw_text(url)
+    if text is None:
+        return {}, {}
+    driver_names = {d["name"] for d in DRIVERS_2026}
+    sprint_results = {}
+    sprint_points = {}
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        track = row.get("Track", "").strip()
+        circuit_key = CSV_TRACK_TO_CIRCUIT_KEY.get(track)
+        if not circuit_key or circuit_key not in SPRINT_CIRCUITS:
+            continue
+        driver = row.get("Driver", "").strip()
+        if driver not in driver_names:
+            continue
+        try:
+            pos = int(row.get("Position", "0"))
+        except (ValueError, TypeError):
+            pos = None
+        try:
+            pts = int(row.get("Points", "0"))
+        except (ValueError, TypeError):
+            pts = 0
+        try:
+            grid = int(row.get("Starting Grid", "0"))
+        except (ValueError, TypeError):
+            grid = 0
+        sprint_results.setdefault(circuit_key, []).append({
+            "driver": driver,
+            "position": pos,
+            "points": pts,
+            "grid": grid,
+        })
+        sprint_points[driver] = sprint_points.get(driver, 0) + pts
+    return sprint_results, sprint_points
+
+
 def _parse_race_time_to_ms(time_str: str) -> int | None:
     """Parse a race time string like '1:23:06.801' to milliseconds."""
     if not time_str:
@@ -1144,6 +1358,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
         "sprint_quali_results": {},
         "sprint_quali_times": {},
         "session_completion": {},
+        "live_fp_times": {},
         "calibration_correction": 1.0,
         "calibration_races": 0,
     }
@@ -1298,6 +1513,74 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
                 session_types.add("SPRINT_RACE_RESULT")
 
         result["session_completion"][circuit_key] = session_types
+
+        # Parse live FP times for this completed round
+        fp_data = {}  # {driver_name: {"fp1": secs, "fp2": secs, "fp3": secs}}
+        if fp1_text:
+            for dn, t in _parse_fp_session_times(fp1_text).items():
+                fp_data.setdefault(dn, {})["fp1"] = t
+        if circuit_key not in SPRINT_CIRCUITS:
+            if fp2_text:
+                for dn, t in _parse_fp_session_times(fp2_text).items():
+                    fp_data.setdefault(dn, {})["fp2"] = t
+            if fp3_text:
+                for dn, t in _parse_fp_session_times(fp3_text).items():
+                    fp_data.setdefault(dn, {})["fp3"] = t
+        if fp_data:
+            result["live_fp_times"][circuit_key] = fp_data
+
+    # Probe upcoming rounds for partial session data (FP1/FP2/FP3/SQ/Q)
+    for circuit_key, slug in sorted_circuits:
+        if circuit_key in result["session_completion"]:
+            continue  # Already probed as a completed round
+        session_types = set()
+        fp1_text = _fetch_raw_text(
+            f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/free-practice-1-results.yml")
+        if fp1_text:
+            session_types.add("FREE_PRACTICE_1_RESULT")
+        else:
+            continue  # If no FP1 yet, later sessions won't exist either
+        fp2_text = None
+        fp3_text = None
+        if circuit_key not in SPRINT_CIRCUITS:
+            fp2_text = _fetch_raw_text(
+                f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/free-practice-2-results.yml")
+            if fp2_text:
+                session_types.add("FREE_PRACTICE_2_RESULT")
+            fp3_text = _fetch_raw_text(
+                f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/free-practice-3-results.yml")
+            if fp3_text:
+                session_types.add("FREE_PRACTICE_3_RESULT")
+        else:
+            sq_text = _fetch_raw_text(
+                f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/sprint-qualifying-results.yml")
+            if sq_text:
+                session_types.add("SPRINT_QUALIFYING_RESULT")
+            sr_text = _fetch_raw_text(
+                f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/sprint-race-results.yml")
+            if sr_text:
+                session_types.add("SPRINT_RACE_RESULT")
+        quali_text = _fetch_raw_text(
+            f"{F1DB_RAW_BASE_URL}/{year}/races/{slug}/qualifying-results.yml")
+        if quali_text:
+            session_types.add("QUALIFYING_RESULT")
+        if session_types:
+            result["session_completion"][circuit_key] = session_types
+
+        # Parse live FP times for this upcoming round
+        fp_data = {}
+        if fp1_text:
+            for dn, t in _parse_fp_session_times(fp1_text).items():
+                fp_data.setdefault(dn, {})["fp1"] = t
+        if circuit_key not in SPRINT_CIRCUITS:
+            if fp2_text:
+                for dn, t in _parse_fp_session_times(fp2_text).items():
+                    fp_data.setdefault(dn, {})["fp2"] = t
+            if fp3_text:
+                for dn, t in _parse_fp_session_times(fp3_text).items():
+                    fp_data.setdefault(dn, {})["fp3"] = t
+        if fp_data:
+            result["live_fp_times"][circuit_key] = fp_data
 
     # Set latest race (highest completed round)
     if completed:
@@ -1542,27 +1825,28 @@ def format_gap(gap_seconds: float) -> str:
     return f"+{gap_seconds:.3f}s"
 
 
-# Single-driver lap projection
+# Single-driver lap projection (used only by calibration routines)
 def project_lap_time(baseline: float, target_ratio: float,
                      team_affinity: float = 1.0, correction: float = 1.0) -> float:
     """Project a driver lap time from Albert Park composite baseline to a target circuit.
 
-    Args:
-        baseline: Driver composite FP baseline lap time in seconds.
-        target_ratio: Circuit lap-time ratio relative to Albert Park.
-        team_affinity: Team circuit-type affinity multiplier.
-        correction: Global correction factor (1.0 = no correction).
+    Used only by auto-calibration which compares projected vs actual race times.
+    Normal projections use circuit-specific FP data or REFERENCE_LAP_TIME × ratio.
     """
     return baseline * target_ratio * team_affinity * correction
 
 
 # Full-grid projection for a given circuit - returns projected total race times
 def calculate_all_projections(circuit_key: str, historical: dict | None = None,
-                              quali_positions: dict | None = None) -> list[dict]:
+                              quali_positions: dict | None = None,
+                              live_fp_data: dict | None = None) -> list[dict]:
     """Calculate projected total race times for all drivers at the given circuit.
 
-    Includes per-driver DNF probability, circuit overtaking difficulty,
-    and expected points (E[Pts]) that account for both factors.
+    Projection priority per driver:
+    1. Live FP data from this circuit (used directly, no ratio scaling).
+    2. Albert Park baselines (only when circuit_key == 'albert_park').
+    3. Circuit reference time from REFERENCE_LAP_TIME × ratio, differentiated
+       only by historical factor and team affinity.
     """
     circuit = CIRCUITS_2026[circuit_key]
     target_ratio = circuit["ratio"]
@@ -1575,8 +1859,19 @@ def calculate_all_projections(circuit_key: str, historical: dict | None = None,
         affinity = TEAM_AFFINITIES.get(driver["tag"], {}).get(circuit_type, 1.0)
         hist_factor = compute_historical_factor(driver["name"], circuit_key, historical) if historical else 1.0
         dnf_prob = compute_driver_dnf_probability(driver["name"], circuit_key, historical)
-        baseline = compute_composite_baseline(driver)
-        projected_lap = project_lap_time(baseline, target_ratio, affinity, GLOBAL_CORRECTION) * hist_factor
+
+        # Use live FP data when available (times already at this circuit)
+        live_driver = (live_fp_data or {}).get(driver["name"])
+        if live_driver:
+            baseline = compute_composite_baseline(live_driver)
+            projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+        elif circuit_key == "albert_park":
+            baseline = compute_composite_baseline(driver)
+            projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+        else:
+            # No circuit-specific FP data — use circuit reference + historical/affinity
+            circuit_ref = REFERENCE_LAP_TIME * target_ratio
+            projected_lap = circuit_ref * affinity * GLOBAL_CORRECTION * hist_factor
         total_race = projected_lap * race_laps
         results.append({
             "driver": driver["name"],
@@ -1665,16 +1960,31 @@ def _parse_quali_time(time_str: str) -> float | None:
         return None
 
 
+def _parse_fp_session_times(fp_text: str) -> dict[str, float]:
+    """Parse free-practice results YAML and return {driver_name: best_time_seconds}."""
+    times = {}
+    for entry in _parse_simple_yaml_list(fp_text):
+        dn = _F1DB_TO_DRIVER.get(entry.get("driverId"))
+        if not dn:
+            continue
+        t = _parse_quali_time(str(entry.get("time", "")))
+        if t is not None:
+            times[dn] = t
+    return times
+
+
 def calculate_qualifying_projections(circuit_key: str,
                                      quali_positions: dict,
                                      quali_times: dict | None = None,
-                                     historical: dict | None = None) -> list[dict]:
+                                     historical: dict | None = None,
+                                     live_fp_data: dict | None = None) -> list[dict]:
     """Calculate projected race outcome based on qualifying results and historical data.
 
     In qualifying mode, the grid order is primary. If qualifying lap times
     are available, they're used to project race times scaled by the circuit's
     lap count and a quali-to-race degradation factor. Otherwise, the practice
     composite baseline is used but ordered by qualifying position.
+    When live_fp_data is available, FP-based fallback uses circuit-specific times.
     """
     circuit = CIRCUITS_2026[circuit_key]
     target_ratio = circuit["ratio"]
@@ -1702,9 +2012,17 @@ def calculate_qualifying_projections(circuit_key: str,
             # Use actual qualifying time, scaled to race pace
             projected_lap = q_time * QUALI_TO_RACE_FACTOR * affinity * GLOBAL_CORRECTION * hist_factor
         else:
-            # Fallback to practice composite
-            baseline = compute_composite_baseline(driver)
-            projected_lap = project_lap_time(baseline, target_ratio, affinity, GLOBAL_CORRECTION) * hist_factor
+            # Fallback to practice composite — prefer live circuit-specific FP data
+            live_driver = (live_fp_data or {}).get(driver["name"])
+            if live_driver:
+                baseline = compute_composite_baseline(live_driver)
+                projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+            elif circuit_key == "albert_park":
+                baseline = compute_composite_baseline(driver)
+                projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+            else:
+                circuit_ref = REFERENCE_LAP_TIME * target_ratio
+                projected_lap = circuit_ref * affinity * GLOBAL_CORRECTION * hist_factor
 
         total_race = projected_lap * race_laps
 
@@ -1753,7 +2071,8 @@ def calculate_qualifying_projections(circuit_key: str,
 def calculate_sprint_projections(circuit_key: str,
                                  sq_positions: dict,
                                  sq_times: dict | None = None,
-                                 historical: dict | None = None) -> list[dict]:
+                                 historical: dict | None = None,
+                                 live_fp_data: dict | None = None) -> list[dict]:
     """Calculate projected sprint race outcome based on sprint qualifying data.
 
     Uses SQ times when available, falls back to FP1 composite baseline.
@@ -1783,8 +2102,17 @@ def calculate_sprint_projections(circuit_key: str,
         if sq_time is not None:
             projected_lap = sq_time * SQ_TO_SPRINT_FACTOR * affinity * GLOBAL_CORRECTION * hist_factor
         else:
-            baseline = compute_composite_baseline(driver)
-            projected_lap = project_lap_time(baseline, target_ratio, affinity, GLOBAL_CORRECTION) * hist_factor
+            # Fallback — prefer live circuit-specific FP data
+            live_driver = (live_fp_data or {}).get(driver["name"])
+            if live_driver:
+                baseline = compute_composite_baseline(live_driver)
+                projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+            elif circuit_key == "albert_park":
+                baseline = compute_composite_baseline(driver)
+                projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+            else:
+                circuit_ref = REFERENCE_LAP_TIME * target_ratio
+                projected_lap = circuit_ref * affinity * GLOBAL_CORRECTION * hist_factor
 
         total_time = projected_lap * sprint_laps
 
@@ -1832,7 +2160,8 @@ def calculate_sprint_projections(circuit_key: str,
 
 def calculate_season_projection(historical: dict | None = None,
                                 actual_standings: list | None = None,
-                                season_calendar: list | None = None) -> list[dict]:
+                                season_calendar: list | None = None,
+                                live_fp_times: dict | None = None) -> list[dict]:
     """Project full-season championship standings.
 
     Sums expected points across all 24 circuits. For completed races (when
@@ -1874,7 +2203,8 @@ def calculate_season_projection(historical: dict | None = None,
     for circuit_key in CIRCUITS_2026:
         if circuit_key in completed_circuits:
             continue
-        projections = calculate_all_projections(circuit_key, historical)
+        fp_data = (live_fp_times or {}).get(circuit_key)
+        projections = calculate_all_projections(circuit_key, historical, live_fp_data=fp_data)
         for p in projections:
             if p["driver"] in driver_totals:
                 driver_totals[p["driver"]]["projected_pts"] += p["exp_pts"]
@@ -1884,7 +2214,8 @@ def calculate_season_projection(historical: dict | None = None,
     for circuit_key in SPRINT_CIRCUITS:
         if circuit_key in completed_circuits:
             continue
-        sprint_proj = calculate_sprint_projections(circuit_key, {}, None, historical)
+        fp_data = (live_fp_times or {}).get(circuit_key)
+        sprint_proj = calculate_sprint_projections(circuit_key, {}, None, historical, fp_data)
         for sp in sprint_proj:
             if sp["driver"] in driver_totals:
                 driver_totals[sp["driver"]]["projected_pts"] += sp["exp_pts"]
@@ -1934,6 +2265,7 @@ class F1ProjectionApp(tk.Tk):
         self.sprint_quali_results = {}  # circuit_key -> {driver_name: sq_position}
         self.sprint_quali_times = {}    # circuit_key -> {driver_name: best_sq_time_seconds}
         self.session_completion = {}  # circuit_key -> set of completed session type strings
+        self.live_fp_times = {}  # circuit_key -> {driver_name: {"fp1": secs, "fp2": secs, "fp3": secs}}
 
         # Track collapsible section state
         self._collapsed = {}  # section_name -> bool
@@ -2128,8 +2460,8 @@ class F1ProjectionApp(tk.Tk):
                         sq_t = fetch_sprint_qualifying_times(conn, ck)
                         if sq_t:
                             self.sprint_quali_times[ck] = sq_t
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self.after(0, self._show_status, f"Sprint quali load error ({ck}): {exc}")
                 # Session completion data (SQLite)
                 self.session_completion = fetch_session_completion(conn)
             finally:
@@ -2164,12 +2496,50 @@ class F1ProjectionApp(tk.Tk):
                         self.session_completion[ck] = types
                     else:
                         self.session_completion[ck] |= types
+                # Merge live FP times from raw fallback
+                for ck, fp_data in raw.get("live_fp_times", {}).items():
+                    if ck not in self.live_fp_times:
+                        self.live_fp_times[ck] = fp_data
                 if raw.get("calibration_races", 0) > 0:
                     with _GC_LOCK:
                         GLOBAL_CORRECTION = raw["calibration_correction"]
                     self.calibration_races = raw["calibration_races"]
             except Exception as exc:
                 self.after(0, self._show_status, f"Raw data error: {exc}")
+
+        # Step 4: Cross-reference with formula1-datasets CSV (supplementary)
+        try:
+            cb = lambda msg: self.after(0, self._show_status, msg)
+            csv_quali, csv_qtimes = fetch_csv_qualifying(
+                progress_callback=cb)
+            for ck, qr in csv_quali.items():
+                if ck not in self.quali_results:
+                    self.quali_results[ck] = qr
+            for ck, qt in csv_qtimes.items():
+                if ck not in self.quali_times:
+                    self.quali_times[ck] = qt
+
+            csv_sq, csv_sqt = fetch_csv_sprint_qualifying(
+                progress_callback=cb)
+            for ck, sqr in csv_sq.items():
+                if ck not in self.sprint_quali_results:
+                    self.sprint_quali_results[ck] = sqr
+            for ck, sqt in csv_sqt.items():
+                if ck not in self.sprint_quali_times:
+                    self.sprint_quali_times[ck] = sqt
+
+            csv_race, csv_standings = fetch_csv_race_results(
+                progress_callback=cb)
+            if not self.driver_standings and csv_standings:
+                self.driver_standings = csv_standings
+
+            csv_sprint, csv_sprint_pts = fetch_csv_sprint_results(
+                progress_callback=cb)
+            for ck in csv_sprint:
+                self.session_completion.setdefault(ck, set()).add(
+                    "sprint-race")
+        except Exception as exc:
+            self.after(0, self._show_status, f"CSV cross-reference error: {exc}")
 
         self.after(0, self._on_all_data_loaded)
 
@@ -2321,6 +2691,7 @@ class F1ProjectionApp(tk.Tk):
             self.historical_data,
             self.driver_standings if self.driver_standings else None,
             self.season_calendar if self.season_calendar else None,
+            self.live_fp_times if self.live_fp_times else None,
         )
 
         completed = sum(1 for e in self.season_calendar if e.get("completed")) if self.season_calendar else 0
@@ -2455,31 +2826,34 @@ class F1ProjectionApp(tk.Tk):
 
         quali = self.quali_results.get(circuit_key, {})
         quali_times = self.quali_times.get(circuit_key, {})
+        live_fp = self.live_fp_times.get(circuit_key)
 
         if mode == "Sprint":
             if circuit_key in SPRINT_CIRCUITS:
                 sq_pos = self.sprint_quali_results.get(circuit_key, {})
                 sq_times_data = self.sprint_quali_times.get(circuit_key, {})
                 projections = calculate_sprint_projections(
-                    circuit_key, sq_pos, sq_times_data, self.historical_data)
+                    circuit_key, sq_pos, sq_times_data, self.historical_data, live_fp)
                 sprint_info = SPRINT_CIRCUITS[circuit_key]
                 mode_text = f"Sprint ({sprint_info['sprint_laps']} laps) · SQ + FP1"
                 if not sq_pos:
                     mode_text += " (no sprint qualifying data yet)"
             else:
                 projections = calculate_all_projections(
-                    circuit_key, self.historical_data, quali or None)
+                    circuit_key, self.historical_data, quali or None, live_fp)
                 mode_text = "No sprint race at this circuit — showing Grand Prix projection"
         elif mode == "Grand Prix +Q" and quali:
             projections = calculate_qualifying_projections(
-                circuit_key, quali, quali_times, self.historical_data)
+                circuit_key, quali, quali_times, self.historical_data, live_fp)
             mode_text = "Grand Prix +Q (FP1/2/3 + Qualifying) + Historical"
         else:
             projections = calculate_all_projections(
-                circuit_key, self.historical_data, quali or None)
+                circuit_key, self.historical_data, quali or None, live_fp)
             mode_text = "Grand Prix (FP1/2/3) + Historical"
             if mode == "Grand Prix +Q" and not quali:
                 mode_text += " (no qualifying data yet)"
+        if live_fp:
+            mode_text += " · Live FP"
 
         self.circuit_info.configure(
             text=f"{circuit['location']} · {circuit['km']} km · {circuit['turns']} turns · {circuit['laps']} laps · {circuit['type'].title()} · Overtaking: {ot_label} ({overtaking:.0%}) · {mode_text}"
