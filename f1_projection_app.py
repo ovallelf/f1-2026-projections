@@ -148,6 +148,7 @@ def compute_cumulative_baseline(driver_name: str,
     """
     FP_BLEND = 0.30      # weight for practice pace per circuit
     RACE_BLEND = 0.70    # weight for race pace per circuit
+    FP_TO_RACE_FACTOR = 1.06  # FP best laps → race avg lap degradation (~6%)
 
     normalized = []  # list of (normalized_baseline, recency_weight)
     n = len(completed_circuits)
@@ -182,7 +183,8 @@ def compute_cumulative_baseline(driver_name: str,
         elif race_norm is not None:
             blended = race_norm
         elif fp_norm is not None:
-            blended = fp_norm
+            # FP-only: apply degradation so FP best laps approximate race pace
+            blended = fp_norm * FP_TO_RACE_FACTOR
         else:
             continue
 
@@ -1511,6 +1513,20 @@ def _parse_race_time_to_ms(time_str: str) -> int | None:
         return None
 
 
+def _parse_gap_to_ms(gap_str: str) -> int | None:
+    """Parse a race gap string like '+5.023' or '+1 lap' to milliseconds.
+
+    Returns ``None`` for non-numeric gaps (lapped cars, retirements).
+    """
+    if not gap_str:
+        return None
+    s = gap_str.strip().lstrip('+')
+    try:
+        return int(float(s) * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
 def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) -> dict:
     """Fetch latest season data from f1db raw YAML files on GitHub main branch.
 
@@ -1596,6 +1612,14 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
                 "fastest_lap": bool(entry.get("fastestLap")),
                 "retired": pos is None or entry.get("reasonRetired") is not None,
             })
+
+        # Reconstruct absolute time_ms for P2+ from winner + gap
+        if winner_time_ms:
+            for r in race_results:
+                if r["time_ms"] is None and not r.get("retired", False) and r["time"]:
+                    gap_ms = _parse_gap_to_ms(r["time"])
+                    if gap_ms is not None:
+                        r["time_ms"] = winner_time_ms + gap_ms
 
         completed[circuit_key] = {
             "round": round_num,
