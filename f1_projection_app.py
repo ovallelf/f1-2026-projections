@@ -87,6 +87,11 @@ DRIVERS_2026 = [
 # FP3 is closest to qualifying/race conditions; FP1 is exploratory
 FP_WEIGHTS = {"fp1": 0.20, "fp2": 0.35, "fp3": 0.45}
 
+# Recency decay factor for cumulative baselines across race weekends.
+# Each older round is weighted λ^n less than the most recent.
+# With 3 races: weights = [0.7225, 0.85, 1.0] → normalized [0.281, 0.330, 0.389]
+RECENCY_DECAY = 0.85
+
 
 def compute_composite_baseline(driver: dict) -> float:
     """Compute a weighted composite baseline from available FP sessions.
@@ -118,6 +123,62 @@ def compute_composite_baseline(driver: dict) -> float:
     # Redistribute weights across available sessions
     total_weight = sum(FP_WEIGHTS[k] for k in sessions)
     return sum(sessions[k] * FP_WEIGHTS[k] / total_weight for k in sessions)
+
+
+def compute_cumulative_baseline(driver_name: str,
+                                live_fp_times: dict,
+                                completed_circuits: list[str],
+                                decay: float = RECENCY_DECAY) -> float | None:
+    """Compute a recency-weighted cumulative baseline from all completed races.
+
+    For each completed circuit with FP data for this driver:
+    1. Compute the per-circuit composite via compute_composite_baseline()
+    2. Normalize to Albert Park equivalent: composite / circuit_ratio
+    3. Apply exponential recency weighting (most recent race = weight 1.0)
+
+    Returns None if no cumulative data is available (caller should fall back
+    to static DRIVERS_2026 baselines).
+    """
+    normalized = []  # list of (normalized_baseline, recency_weight)
+    n = len(completed_circuits)
+    for i, ck in enumerate(completed_circuits):
+        circuit_fp = live_fp_times.get(ck, {})
+        driver_fp = circuit_fp.get(driver_name)
+        if not driver_fp:
+            continue
+        composite = compute_composite_baseline(driver_fp)
+        ratio = CIRCUITS_2026[ck]["ratio"]
+        norm = composite / ratio  # normalize to Albert Park equivalent
+        weight = decay ** (n - i - 1)  # most recent = decay^0 = 1.0
+        normalized.append((norm, weight))
+
+    if not normalized:
+        return None
+
+    total_weight = sum(w for _, w in normalized)
+    return sum(v * w for v, w in normalized) / total_weight
+
+
+def build_cumulative_baselines(live_fp_times: dict,
+                               session_completion: dict) -> dict[str, float]:
+    """Build cumulative baselines for all drivers from completed race weekends.
+
+    Returns {driver_name: normalized_baseline} for drivers with data.
+    Circuits are considered completed when RACE_RESULT is in their session_completion set.
+    """
+    # Determine completed circuits in round order
+    completed = [ck for ck in CIRCUIT_ROUND_ORDER
+                 if "RACE_RESULT" in session_completion.get(ck, set())]
+
+    if not completed:
+        return {}
+
+    baselines = {}
+    for driver in DRIVERS_2026:
+        bl = compute_cumulative_baseline(driver["name"], live_fp_times, completed)
+        if bl is not None:
+            baselines[driver["name"]] = bl
+    return baselines
 
 # Step 1.3 – Team affinities by circuit type
 TEAM_AFFINITIES = {
@@ -282,6 +343,10 @@ RACE_DIR_SLUGS = {
     "lusail": "23-qatar",
     "yas_marina": "24-abu-dhabi",
 }
+
+# Circuit keys in round order (derived from RACE_DIR_SLUGS).
+# Used to determine which circuits precede the target for cumulative baselines.
+CIRCUIT_ROUND_ORDER = list(RACE_DIR_SLUGS.keys())
 
 
 def download_f1db(progress_callback=None):
@@ -1831,14 +1896,14 @@ def format_gap(gap_seconds: float) -> str:
 # Full-grid projection for a given circuit - returns projected total race times
 def calculate_all_projections(circuit_key: str, historical: dict | None = None,
                               quali_positions: dict | None = None,
-                              live_fp_data: dict | None = None) -> list[dict]:
+                              live_fp_data: dict | None = None,
+                              cumulative_baselines: dict | None = None) -> list[dict]:
     """Calculate projected total race times for all drivers at the given circuit.
 
     Projection priority per driver:
     1. Live FP data from this circuit (used directly, no ratio scaling).
-    2. Albert Park baselines (only when circuit_key == 'albert_park').
-    3. Driver-specific baseline from compute_composite_baseline × circuit ratio,
-       differentiated by historical factor and team affinity.
+    2. Cumulative baseline from all completed races × circuit ratio.
+    3. Static DRIVERS_2026 baseline × circuit ratio (Round 1 fallback).
     """
     circuit = CIRCUITS_2026[circuit_key]
     target_ratio = circuit["ratio"]
@@ -1857,11 +1922,12 @@ def calculate_all_projections(circuit_key: str, historical: dict | None = None,
         if live_driver:
             baseline = compute_composite_baseline(live_driver)
             projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
-        elif circuit_key == "albert_park":
-            baseline = compute_composite_baseline(driver)
-            projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+        elif cumulative_baselines and driver["name"] in cumulative_baselines:
+            # Cumulative baseline from all completed races (normalized to AP)
+            baseline = cumulative_baselines[driver["name"]]
+            projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
         else:
-            # No circuit-specific FP data — scale Albert Park baseline by circuit ratio
+            # Fallback to static DRIVERS_2026 baseline (Round 1 or no data)
             baseline = compute_composite_baseline(driver)
             projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
         total_race = projected_lap * race_laps
@@ -1969,14 +2035,15 @@ def calculate_qualifying_projections(circuit_key: str,
                                      quali_positions: dict,
                                      quali_times: dict | None = None,
                                      historical: dict | None = None,
-                                     live_fp_data: dict | None = None) -> list[dict]:
+                                     live_fp_data: dict | None = None,
+                                     cumulative_baselines: dict | None = None) -> list[dict]:
     """Calculate projected race outcome based on qualifying results and historical data.
 
-    In qualifying mode, the grid order is primary. If qualifying lap times
-    are available, they're used to project race times scaled by the circuit's
-    lap count and a quali-to-race degradation factor. Otherwise, the practice
-    composite baseline is used but ordered by qualifying position.
-    When live_fp_data is available, FP-based fallback uses circuit-specific times.
+    When qualifying lap times are available, they project race times via a
+    quali-to-race degradation factor. Otherwise, FP fallback priority:
+    1. Live FP data from this circuit.
+    2. Cumulative baseline from completed races × circuit ratio.
+    3. Static DRIVERS_2026 baseline × circuit ratio (Round 1 fallback).
     """
     circuit = CIRCUITS_2026[circuit_key]
     target_ratio = circuit["ratio"]
@@ -2009,9 +2076,9 @@ def calculate_qualifying_projections(circuit_key: str,
             if live_driver:
                 baseline = compute_composite_baseline(live_driver)
                 projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
-            elif circuit_key == "albert_park":
-                baseline = compute_composite_baseline(driver)
-                projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+            elif cumulative_baselines and driver["name"] in cumulative_baselines:
+                baseline = cumulative_baselines[driver["name"]]
+                projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
             else:
                 baseline = compute_composite_baseline(driver)
                 projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
@@ -2064,11 +2131,14 @@ def calculate_sprint_projections(circuit_key: str,
                                  sq_positions: dict,
                                  sq_times: dict | None = None,
                                  historical: dict | None = None,
-                                 live_fp_data: dict | None = None) -> list[dict]:
+                                 live_fp_data: dict | None = None,
+                                 cumulative_baselines: dict | None = None) -> list[dict]:
     """Calculate projected sprint race outcome based on sprint qualifying data.
 
-    Uses SQ times when available, falls back to FP1 composite baseline.
-    Sprint-specific: shorter distance, lower degradation, reduced DNF probability.
+    Uses SQ times when available, otherwise FP fallback priority:
+    1. Live FP data from this circuit.
+    2. Cumulative baseline from completed races × circuit ratio.
+    3. Static DRIVERS_2026 baseline × circuit ratio (Round 1 fallback).
     Returns empty list if the circuit does not host a sprint race.
     """
     sprint_info = SPRINT_CIRCUITS.get(circuit_key)
@@ -2099,9 +2169,9 @@ def calculate_sprint_projections(circuit_key: str,
             if live_driver:
                 baseline = compute_composite_baseline(live_driver)
                 projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
-            elif circuit_key == "albert_park":
-                baseline = compute_composite_baseline(driver)
-                projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+            elif cumulative_baselines and driver["name"] in cumulative_baselines:
+                baseline = cumulative_baselines[driver["name"]]
+                projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
             else:
                 baseline = compute_composite_baseline(driver)
                 projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
@@ -2153,7 +2223,8 @@ def calculate_sprint_projections(circuit_key: str,
 def calculate_season_projection(historical: dict | None = None,
                                 actual_standings: list | None = None,
                                 season_calendar: list | None = None,
-                                live_fp_times: dict | None = None) -> list[dict]:
+                                live_fp_times: dict | None = None,
+                                session_completion: dict | None = None) -> list[dict]:
     """Project full-season championship standings.
 
     Sums expected points across all 24 circuits. For completed races (when
@@ -2191,12 +2262,16 @@ def calculate_season_projection(historical: dict | None = None,
                 if ck:
                     completed_circuits.add(ck)
 
+    # Build cumulative baselines from all completed race weekends
+    cum_baselines = build_cumulative_baselines(live_fp_times or {}, session_completion or {})
+
     # Project remaining races
     for circuit_key in CIRCUITS_2026:
         if circuit_key in completed_circuits:
             continue
         fp_data = (live_fp_times or {}).get(circuit_key)
-        projections = calculate_all_projections(circuit_key, historical, live_fp_data=fp_data)
+        projections = calculate_all_projections(circuit_key, historical, live_fp_data=fp_data,
+                                                cumulative_baselines=cum_baselines)
         for p in projections:
             if p["driver"] in driver_totals:
                 driver_totals[p["driver"]]["projected_pts"] += p["exp_pts"]
@@ -2207,7 +2282,8 @@ def calculate_season_projection(historical: dict | None = None,
         if circuit_key in completed_circuits:
             continue
         fp_data = (live_fp_times or {}).get(circuit_key)
-        sprint_proj = calculate_sprint_projections(circuit_key, {}, None, historical, fp_data)
+        sprint_proj = calculate_sprint_projections(circuit_key, {}, None, historical, fp_data,
+                                                   cumulative_baselines=cum_baselines)
         for sp in sprint_proj:
             if sp["driver"] in driver_totals:
                 driver_totals[sp["driver"]]["projected_pts"] += sp["exp_pts"]
@@ -2684,6 +2760,7 @@ class F1ProjectionApp(tk.Tk):
             self.driver_standings if self.driver_standings else None,
             self.season_calendar if self.season_calendar else None,
             self.live_fp_times if self.live_fp_times else None,
+            self.session_completion if self.session_completion else None,
         )
 
         completed = sum(1 for e in self.season_calendar if e.get("completed")) if self.season_calendar else 0
@@ -2819,33 +2896,40 @@ class F1ProjectionApp(tk.Tk):
         quali = self.quali_results.get(circuit_key, {})
         quali_times = self.quali_times.get(circuit_key, {})
         live_fp = self.live_fp_times.get(circuit_key)
+        cum_baselines = build_cumulative_baselines(self.live_fp_times, self.session_completion)
 
         if mode == "Sprint":
             if circuit_key in SPRINT_CIRCUITS:
                 sq_pos = self.sprint_quali_results.get(circuit_key, {})
                 sq_times_data = self.sprint_quali_times.get(circuit_key, {})
                 projections = calculate_sprint_projections(
-                    circuit_key, sq_pos, sq_times_data, self.historical_data, live_fp)
+                    circuit_key, sq_pos, sq_times_data, self.historical_data, live_fp,
+                    cumulative_baselines=cum_baselines)
                 sprint_info = SPRINT_CIRCUITS[circuit_key]
                 mode_text = f"Sprint ({sprint_info['sprint_laps']} laps) · SQ + FP1"
                 if not sq_pos:
                     mode_text += " (no sprint qualifying data yet)"
             else:
                 projections = calculate_all_projections(
-                    circuit_key, self.historical_data, quali or None, live_fp)
+                    circuit_key, self.historical_data, quali or None, live_fp,
+                    cumulative_baselines=cum_baselines)
                 mode_text = "No sprint race at this circuit — showing Grand Prix projection"
         elif mode == "Grand Prix +Q" and quali:
             projections = calculate_qualifying_projections(
-                circuit_key, quali, quali_times, self.historical_data, live_fp)
+                circuit_key, quali, quali_times, self.historical_data, live_fp,
+                cumulative_baselines=cum_baselines)
             mode_text = "Grand Prix +Q (FP1/2/3 + Qualifying) + Historical"
         else:
             projections = calculate_all_projections(
-                circuit_key, self.historical_data, quali or None, live_fp)
+                circuit_key, self.historical_data, quali or None, live_fp,
+                cumulative_baselines=cum_baselines)
             mode_text = "Grand Prix (FP1/2/3) + Historical"
             if mode == "Grand Prix +Q" and not quali:
                 mode_text += " (no qualifying data yet)"
         if live_fp:
             mode_text += " · Live FP"
+        if cum_baselines:
+            mode_text += f" · Cumulative ({len([ck for ck in CIRCUIT_ROUND_ORDER if 'RACE_RESULT' in self.session_completion.get(ck, set())])} races)"
 
         self.circuit_info.configure(
             text=f"{circuit['location']} · {circuit['km']} km · {circuit['turns']} turns · {circuit['laps']} laps · {circuit['type'].title()} · Overtaking: {ot_label} ({overtaking:.0%}) · {mode_text}"
