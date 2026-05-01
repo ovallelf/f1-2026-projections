@@ -180,6 +180,30 @@ def build_cumulative_baselines(live_fp_times: dict,
             baselines[driver["name"]] = bl
     return baselines
 
+
+def build_season_dnf_tracker(race_results: dict) -> dict[str, dict]:
+    """Build per-team DNF tracker from all 2026 race results.
+
+    Returns {team_tag: {"starts": int, "dnfs": int}} aggregated across
+    all completed races.
+    """
+    # Build driver -> tag lookup
+    driver_tag = {d["name"]: d["tag"] for d in DRIVERS_2026}
+    tracker: dict[str, dict] = {}
+    for _circuit_key, results_list in race_results.items():
+        for entry in results_list:
+            driver_name = entry.get("driver") or entry.get("name", "")
+            tag = driver_tag.get(driver_name)
+            if not tag:
+                continue
+            if tag not in tracker:
+                tracker[tag] = {"starts": 0, "dnfs": 0}
+            tracker[tag]["starts"] += 1
+            if entry.get("retired", False):
+                tracker[tag]["dnfs"] += 1
+    return tracker
+
+
 # Step 1.3 – Team affinities by circuit type
 TEAM_AFFINITIES = {
     "mclaren":       {"power": 1.00, "technical": 0.99, "mixed": 1.00},
@@ -931,6 +955,44 @@ def fetch_latest_race_result(conn, year=2026):
         return None
 
 
+def fetch_all_race_results(conn, year=2026):
+    """Query f1db for all completed race results in the season.
+
+    Returns {circuit_key: [result_dicts]} where each result dict contains:
+    position, driver, constructor_id, time_ms, points, fastest_lap, retired.
+    """
+    if conn is None:
+        return {}
+    try:
+        rows = conn.execute("""
+            SELECT r.circuit_id, rd.position_number, rd.driver_id,
+                   rd.constructor_id, rd.race_time_millis, rd.race_points,
+                   rd.race_fastest_lap, rd.race_reason_retired
+            FROM race_data rd
+            JOIN race r ON rd.race_id = r.id
+            WHERE rd.type = 'RACE_RESULT' AND r.year = ?
+            ORDER BY r.round, rd.position_display_order
+        """, (year,)).fetchall()
+        results = {}
+        for row in rows:
+            circuit_key = _F1DB_TO_CIRCUIT.get(row["circuit_id"])
+            if circuit_key is None:
+                continue
+            name = _F1DB_TO_DRIVER.get(row["driver_id"], row["driver_id"])
+            results.setdefault(circuit_key, []).append({
+                "position": row["position_number"],
+                "driver": name,
+                "constructor_id": row["constructor_id"],
+                "time_ms": row["race_time_millis"],
+                "points": float(row["race_points"] or 0),
+                "fastest_lap": bool(row["race_fastest_lap"]),
+                "retired": row["race_reason_retired"] is not None,
+            })
+        return results
+    except sqlite3.Error:
+        return {}
+
+
 def fetch_season_calendar(conn, year=2026):
     """Query f1db for the race calendar with completion status."""
     if conn is None:
@@ -1427,6 +1489,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
         "sprint_quali_times": {},
         "session_completion": {},
         "live_fp_times": {},
+        "race_results": {},
         "calibration_correction": 1.0,
         "calibration_races": 0,
     }
@@ -1489,8 +1552,10 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
                 "driver_id": entry.get("driverId"),
                 "constructor_id": entry.get("constructorId"),
                 "time": time_str,
+                "time_ms": time_ms,
                 "points": float(entry.get("points", 0) or 0),
-                "fastest_lap": False,
+                "fastest_lap": bool(entry.get("fastestLap")),
+                "retired": pos is None or entry.get("reasonRetired") is not None,
             })
 
         completed[circuit_key] = {
@@ -1501,6 +1566,7 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
             "results": race_results,
             "winner_time_ms": winner_time_ms,
         }
+        result["race_results"][circuit_key] = race_results
 
         # Fetch qualifying for this completed round
         quali_text = _fetch_raw_text(
@@ -1734,7 +1800,8 @@ def compute_historical_factor(driver_name, circuit_key, historical):
     return max(0.98, min(1.02, factor))
 
 
-def compute_driver_dnf_probability(driver_name, circuit_key, historical):
+def compute_driver_dnf_probability(driver_name, circuit_key, historical,
+                                    season_dnf_tracker=None):
     """Compute per-driver DNF probability for a specific circuit.
 
     Blends team baseline reliability with the driver's individual historical
@@ -1746,6 +1813,15 @@ def compute_driver_dnf_probability(driver_name, circuit_key, historical):
         return 0.08  # Fallback grid average
 
     team_baseline = TEAM_DNF_PROBABILITY.get(driver_info["tag"], 0.08)
+
+    # Blend current-season DNF data into team baseline
+    if season_dnf_tracker:
+        tag_data = season_dnf_tracker.get(driver_info["tag"])
+        if tag_data and tag_data["starts"] >= 4:  # Need min 4 starts (2 drivers × 2 races)
+            current_rate = tag_data["dnfs"] / tag_data["starts"]
+            # Ramp weight from 0→60% over the first 20 team-starts
+            season_weight = min(tag_data["starts"] / 20, 0.6)
+            team_baseline = season_weight * current_rate + (1 - season_weight) * team_baseline
 
     if not historical:
         return team_baseline
@@ -1897,7 +1973,8 @@ def format_gap(gap_seconds: float) -> str:
 def calculate_all_projections(circuit_key: str, historical: dict | None = None,
                               quali_positions: dict | None = None,
                               live_fp_data: dict | None = None,
-                              cumulative_baselines: dict | None = None) -> list[dict]:
+                              cumulative_baselines: dict | None = None,
+                              season_dnf_tracker: dict | None = None) -> list[dict]:
     """Calculate projected total race times for all drivers at the given circuit.
 
     Projection priority per driver:
@@ -1915,7 +1992,8 @@ def calculate_all_projections(circuit_key: str, historical: dict | None = None,
     for driver in DRIVERS_2026:
         affinity = TEAM_AFFINITIES.get(driver["tag"], {}).get(circuit_type, 1.0)
         hist_factor = compute_historical_factor(driver["name"], circuit_key, historical) if historical else 1.0
-        dnf_prob = compute_driver_dnf_probability(driver["name"], circuit_key, historical)
+        dnf_prob = compute_driver_dnf_probability(driver["name"], circuit_key, historical,
+                                                   season_dnf_tracker=season_dnf_tracker)
 
         # Use live FP data when available (times already at this circuit)
         live_driver = (live_fp_data or {}).get(driver["name"])
@@ -2036,7 +2114,8 @@ def calculate_qualifying_projections(circuit_key: str,
                                      quali_times: dict | None = None,
                                      historical: dict | None = None,
                                      live_fp_data: dict | None = None,
-                                     cumulative_baselines: dict | None = None) -> list[dict]:
+                                     cumulative_baselines: dict | None = None,
+                                     season_dnf_tracker: dict | None = None) -> list[dict]:
     """Calculate projected race outcome based on qualifying results and historical data.
 
     When qualifying lap times are available, they project race times via a
@@ -2062,7 +2141,8 @@ def calculate_qualifying_projections(circuit_key: str,
         quali_pos = quali_positions.get(driver["name"])
         hist_factor = (compute_historical_factor(driver["name"], circuit_key, historical)
                        if historical else 1.0)
-        dnf_prob = compute_driver_dnf_probability(driver["name"], circuit_key, historical)
+        dnf_prob = compute_driver_dnf_probability(driver["name"], circuit_key, historical,
+                                                   season_dnf_tracker=season_dnf_tracker)
         affinity = TEAM_AFFINITIES.get(driver["tag"], {}).get(circuit_type, 1.0)
 
         # Determine lap time baseline
@@ -2132,7 +2212,8 @@ def calculate_sprint_projections(circuit_key: str,
                                  sq_times: dict | None = None,
                                  historical: dict | None = None,
                                  live_fp_data: dict | None = None,
-                                 cumulative_baselines: dict | None = None) -> list[dict]:
+                                 cumulative_baselines: dict | None = None,
+                                 season_dnf_tracker: dict | None = None) -> list[dict]:
     """Calculate projected sprint race outcome based on sprint qualifying data.
 
     Uses SQ times when available, otherwise FP fallback priority:
@@ -2156,7 +2237,8 @@ def calculate_sprint_projections(circuit_key: str,
         sq_pos = sq_positions.get(driver["name"])
         hist_factor = (compute_historical_factor(driver["name"], circuit_key, historical)
                        if historical else 1.0)
-        race_dnf = compute_driver_dnf_probability(driver["name"], circuit_key, historical)
+        race_dnf = compute_driver_dnf_probability(driver["name"], circuit_key, historical,
+                                                     season_dnf_tracker=season_dnf_tracker)
         sprint_dnf = race_dnf * SPRINT_DNF_FACTOR
         affinity = TEAM_AFFINITIES.get(driver["tag"], {}).get(circuit_type, 1.0)
 
@@ -2224,7 +2306,8 @@ def calculate_season_projection(historical: dict | None = None,
                                 actual_standings: list | None = None,
                                 season_calendar: list | None = None,
                                 live_fp_times: dict | None = None,
-                                session_completion: dict | None = None) -> list[dict]:
+                                session_completion: dict | None = None,
+                                season_dnf_tracker: dict | None = None) -> list[dict]:
     """Project full-season championship standings.
 
     Sums expected points across all 24 circuits. For completed races (when
@@ -2271,7 +2354,8 @@ def calculate_season_projection(historical: dict | None = None,
             continue
         fp_data = (live_fp_times or {}).get(circuit_key)
         projections = calculate_all_projections(circuit_key, historical, live_fp_data=fp_data,
-                                                cumulative_baselines=cum_baselines)
+                                                cumulative_baselines=cum_baselines,
+                                                season_dnf_tracker=season_dnf_tracker)
         for p in projections:
             if p["driver"] in driver_totals:
                 driver_totals[p["driver"]]["projected_pts"] += p["exp_pts"]
@@ -2283,7 +2367,8 @@ def calculate_season_projection(historical: dict | None = None,
             continue
         fp_data = (live_fp_times or {}).get(circuit_key)
         sprint_proj = calculate_sprint_projections(circuit_key, {}, None, historical, fp_data,
-                                                   cumulative_baselines=cum_baselines)
+                                                   cumulative_baselines=cum_baselines,
+                                                   season_dnf_tracker=season_dnf_tracker)
         for sp in sprint_proj:
             if sp["driver"] in driver_totals:
                 driver_totals[sp["driver"]]["projected_pts"] += sp["exp_pts"]
@@ -2294,6 +2379,84 @@ def calculate_season_projection(historical: dict | None = None,
         dt["total_pts"] = round(dt["actual_pts"] + dt["projected_pts"], 1)
         dt["projected_pts"] = round(dt["projected_pts"], 1)
         result.append(dt)
+
+    result.sort(key=lambda r: r["total_pts"], reverse=True)
+
+    # Compute points gap and theoretical maximum
+    remaining_races = sum(1 for ck in CIRCUITS_2026 if ck not in completed_circuits)
+    remaining_sprints = sum(1 for ck in SPRINT_CIRCUITS if ck not in completed_circuits)
+    max_race_pts = 26  # 25 + 1 fastest lap
+    max_sprint_pts = 8
+    theoretical_max_remaining = remaining_races * max_race_pts + remaining_sprints * max_sprint_pts
+
+    leader_pts = result[0]["total_pts"] if result else 0
+
+    for i, dt in enumerate(result):
+        dt["gap_to_leader"] = round(leader_pts - dt["total_pts"], 1) if i > 0 else 0.0
+        dt["max_possible"] = round(dt["actual_pts"] + theoretical_max_remaining, 1)
+        dt["can_win"] = dt["max_possible"] >= leader_pts
+
+    return result
+
+
+def calculate_constructor_season_projection(
+    historical: dict | None = None,
+    actual_standings: list | None = None,
+    season_calendar: list | None = None,
+    live_fp_times: dict | None = None,
+    session_completion: dict | None = None,
+    actual_constructor_standings: list | None = None,
+    season_dnf_tracker: dict | None = None,
+) -> list[dict]:
+    """Project full-season constructor championship standings.
+
+    Aggregates driver season projections by team. Uses actual constructor
+    standings for completed-race points when available.
+    """
+    # Get driver projections
+    driver_proj = calculate_season_projection(
+        historical, actual_standings, season_calendar,
+        live_fp_times, session_completion, season_dnf_tracker)
+
+    # Aggregate by team tag
+    team_totals: dict[str, dict] = {}
+    for dp in driver_proj:
+        tag = dp["tag"]
+        if tag not in team_totals:
+            team_totals[tag] = {
+                "team": dp["team"], "tag": tag,
+                "actual_pts": 0.0, "projected_pts": 0.0,
+                "drivers": [],
+            }
+        team_totals[tag]["projected_pts"] += dp["projected_pts"]
+        team_totals[tag]["drivers"].append(dp["driver"])
+
+    # Override actual points from constructor standings if available
+    if actual_constructor_standings:
+        cid_to_tag = {}
+        for tag, cids in CONSTRUCTOR_F1DB_IDS.items():
+            if isinstance(cids, list):
+                for cid in cids:
+                    cid_to_tag[cid] = tag
+            else:
+                cid_to_tag[cids] = tag
+        for cs in actual_constructor_standings:
+            tag = cid_to_tag.get(cs.get("constructor_id"))
+            if tag and tag in team_totals:
+                team_totals[tag]["actual_pts"] = cs["points"]
+
+    # If no constructor standings, sum driver actual points
+    if not actual_constructor_standings:
+        for dp in driver_proj:
+            tag = dp["tag"]
+            if tag in team_totals:
+                team_totals[tag]["actual_pts"] += dp["actual_pts"]
+
+    result = []
+    for tt in team_totals.values():
+        tt["total_pts"] = round(tt["actual_pts"] + tt["projected_pts"], 1)
+        tt["projected_pts"] = round(tt["projected_pts"], 1)
+        result.append(tt)
 
     result.sort(key=lambda r: r["total_pts"], reverse=True)
     return result
@@ -2319,6 +2482,7 @@ class F1ProjectionApp(tk.Tk):
         self.rowconfigure(5, weight=0)  # Standings content
         self.rowconfigure(6, weight=0)  # Championship toggle
         self.rowconfigure(7, weight=0)  # Championship content
+        self.rowconfigure(8, weight=0)  # Constructor championship content
 
         # Phase 3 instance variables
         self.latest_race = None
@@ -2334,6 +2498,8 @@ class F1ProjectionApp(tk.Tk):
         self.sprint_quali_times = {}    # circuit_key -> {driver_name: best_sq_time_seconds}
         self.session_completion = {}  # circuit_key -> set of completed session type strings
         self.live_fp_times = {}  # circuit_key -> {driver_name: {"fp1": secs, "fp2": secs, "fp3": secs}}
+        self.race_results = {}  # circuit_key -> [result_dicts]
+        self.season_dnf_tracker = {}  # team_tag -> {starts, dnfs}
 
         # Track collapsible section state
         self._collapsed = {}  # section_name -> bool
@@ -2532,6 +2698,8 @@ class F1ProjectionApp(tk.Tk):
                         self.after(0, self._show_status, f"Sprint quali load error ({ck}): {exc}")
                 # Session completion data (SQLite)
                 self.session_completion = fetch_session_completion(conn)
+                # All race results (SQLite)
+                self.race_results = fetch_all_race_results(conn)
             finally:
                 conn.close()
 
@@ -2568,6 +2736,10 @@ class F1ProjectionApp(tk.Tk):
                 for ck, fp_data in raw.get("live_fp_times", {}).items():
                     if ck not in self.live_fp_times:
                         self.live_fp_times[ck] = fp_data
+                # Merge race results from raw fallback
+                for ck, results in raw.get("race_results", {}).items():
+                    if ck not in self.race_results:
+                        self.race_results[ck] = results
                 if raw.get("calibration_races", 0) > 0:
                     with _GC_LOCK:
                         GLOBAL_CORRECTION = raw["calibration_correction"]
@@ -2596,8 +2768,11 @@ class F1ProjectionApp(tk.Tk):
                 if ck not in self.sprint_quali_times:
                     self.sprint_quali_times[ck] = sqt
 
-            _, csv_standings = fetch_csv_race_results(
+            csv_race_results, csv_standings = fetch_csv_race_results(
                 progress_callback=cb)
+            for ck, results in csv_race_results.items():
+                if ck not in self.race_results:
+                    self.race_results[ck] = results
             if not self.driver_standings and csv_standings:
                 self.driver_standings = csv_standings
 
@@ -2608,6 +2783,9 @@ class F1ProjectionApp(tk.Tk):
                     "sprint-race")
         except Exception as exc:
             self.after(0, self._show_status, f"CSV cross-reference error: {exc}")
+
+        # Build season DNF tracker from all collected race results
+        self.season_dnf_tracker = build_season_dnf_tracker(self.race_results)
 
         self.after(0, self._on_all_data_loaded)
 
@@ -2721,20 +2899,27 @@ class F1ProjectionApp(tk.Tk):
         self._champ_content.columnconfigure(0, weight=1)
         frame = self._champ_content
 
+        # --- Driver Championship ---
+        ttk.Label(frame, text="Driver Championship", style="Sub.TLabel",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(2, 4))
+
         self.champ_tree = ttk.Treeview(
             frame,
-            columns=("pos", "driver", "team", "actual", "projected", "total", "races"),
+            columns=("pos", "driver", "team", "actual", "projected", "total",
+                     "gap", "max_possible", "races"),
             show="headings", selectmode="browse", height=10
         )
 
         champ_cols = {
-            "pos":       ("Pos",    40,  "center"),
-            "driver":    ("Driver", 160, "w"),
-            "team":      ("Team",   150, "w"),
-            "actual":    ("Current Pts", 85,  "center"),
-            "projected": ("Remaining", 80,  "center"),
-            "total":     ("Est. Final", 80,  "center"),
-            "races":     ("Races Projected", 110, "center"),
+            "pos":          ("Pos",            40,  "center"),
+            "driver":       ("Driver",         150, "w"),
+            "team":         ("Team",           130, "w"),
+            "actual":       ("Current Pts",    80,  "center"),
+            "projected":    ("Remaining",      75,  "center"),
+            "total":        ("Est. Final",     75,  "center"),
+            "gap":          ("Gap",            60,  "center"),
+            "max_possible": ("Max Possible",   85,  "center"),
+            "races":        ("Races Proj.",    80,  "center"),
         }
         for cid, (heading, width, anchor) in champ_cols.items():
             self.champ_tree.heading(cid, text=heading)
@@ -2750,8 +2935,42 @@ class F1ProjectionApp(tk.Tk):
                                        style="Sub.TLabel", font=("Segoe UI", 9, "italic"))
         self.champ_status.pack(anchor="w", pady=(2, 0))
 
+        # --- Constructor Championship ---
+        constructor_frame = ttk.LabelFrame(self, text="Constructor Championship",
+                                           padding=(10, 5))
+        constructor_frame.grid(row=8, column=0, sticky="ew", padx=20, pady=(0, 10))
+        constructor_frame.columnconfigure(0, weight=1)
+
+        self.constructor_tree = ttk.Treeview(
+            constructor_frame,
+            columns=("pos", "team", "actual", "projected", "total"),
+            show="headings", selectmode="browse", height=11
+        )
+
+        constr_cols = {
+            "pos":       ("Pos",         40,  "center"),
+            "team":      ("Team",        180, "w"),
+            "actual":    ("Current Pts", 100, "center"),
+            "projected": ("Projected",   100, "center"),
+            "total":     ("Est. Final",  100, "center"),
+        }
+        for cid, (heading, width, anchor) in constr_cols.items():
+            self.constructor_tree.heading(cid, text=heading)
+            self.constructor_tree.column(cid, width=width, anchor=anchor, minwidth=40)
+
+        for tag, colors in TEAM_COLORS.items():
+            self.constructor_tree.tag_configure(tag, background=colors["bg"], foreground=colors["fg"])
+
+        self.constructor_tree.pack(fill="x", expand=True)
+
+        self.constructor_status = ttk.Label(constructor_frame,
+                                            text="Computing constructor projections...",
+                                            style="Sub.TLabel", font=("Segoe UI", 9, "italic"))
+        self.constructor_status.pack(anchor="w", pady=(2, 0))
+
     def _update_championship_projection(self):
         """Recalculate and display projected season championship."""
+        # --- Driver Championship ---
         for item in self.champ_tree.get_children():
             self.champ_tree.delete(item)
 
@@ -2761,6 +2980,7 @@ class F1ProjectionApp(tk.Tk):
             self.season_calendar if self.season_calendar else None,
             self.live_fp_times if self.live_fp_times else None,
             self.session_completion if self.session_completion else None,
+            self.season_dnf_tracker if self.season_dnf_tracker else None,
         )
 
         completed = sum(1 for e in self.season_calendar if e.get("completed")) if self.season_calendar else 0
@@ -2768,11 +2988,17 @@ class F1ProjectionApp(tk.Tk):
         remaining = total_races - completed
 
         for i, p in enumerate(projections, start=1):
+            gap_str = "" if p["gap_to_leader"] == 0.0 else f"+{p['gap_to_leader']:.1f}"
+            max_str = f"{p['max_possible']:.0f}"
+            if not p["can_win"]:
+                max_str += " \u2717"  # ✗ marker when mathematically eliminated
             self.champ_tree.insert("", "end",
                                     values=(i, p["driver"], p["team"],
                                             f"{p['actual_pts']:.0f}" if p['actual_pts'] > 0 else "\u2014",
                                             f"{p['projected_pts']:.1f}",
                                             f"{p['total_pts']:.1f}",
+                                            gap_str,
+                                            max_str,
                                             p["races_projected"]),
                                     tags=(p["tag"],))
 
@@ -2781,6 +3007,31 @@ class F1ProjectionApp(tk.Tk):
             status += f" \u00b7 Using actual points for {completed} race{'s' if completed != 1 else ''}"
         status += "  |  Current Pts = official standings \u00b7 Remaining = projected future races \u00b7 Est. Final = Current + Remaining"
         self.champ_status.configure(text=status)
+
+        # --- Constructor Championship ---
+        for item in self.constructor_tree.get_children():
+            self.constructor_tree.delete(item)
+
+        constr_proj = calculate_constructor_season_projection(
+            self.historical_data,
+            self.driver_standings if self.driver_standings else None,
+            self.season_calendar if self.season_calendar else None,
+            self.live_fp_times if self.live_fp_times else None,
+            self.session_completion if self.session_completion else None,
+            self.constructor_standings if self.constructor_standings else None,
+            self.season_dnf_tracker if self.season_dnf_tracker else None,
+        )
+
+        for i, cp in enumerate(constr_proj, start=1):
+            self.constructor_tree.insert("", "end",
+                                         values=(i, cp["team"],
+                                                 f"{cp['actual_pts']:.0f}" if cp['actual_pts'] > 0 else "\u2014",
+                                                 f"{cp['projected_pts']:.1f}",
+                                                 f"{cp['total_pts']:.1f}"),
+                                         tags=(cp["tag"],))
+
+        constr_status = f"{completed}/{total_races} races completed \u00b7 Aggregated from driver projections"
+        self.constructor_status.configure(text=constr_status)
 
     def _update_standings(self):
         """Refresh standings display from self.driver_standings / self.constructor_standings."""
@@ -2904,7 +3155,8 @@ class F1ProjectionApp(tk.Tk):
                 sq_times_data = self.sprint_quali_times.get(circuit_key, {})
                 projections = calculate_sprint_projections(
                     circuit_key, sq_pos, sq_times_data, self.historical_data, live_fp,
-                    cumulative_baselines=cum_baselines)
+                    cumulative_baselines=cum_baselines,
+                    season_dnf_tracker=self.season_dnf_tracker)
                 sprint_info = SPRINT_CIRCUITS[circuit_key]
                 mode_text = f"Sprint ({sprint_info['sprint_laps']} laps) · SQ + FP1"
                 if not sq_pos:
@@ -2912,17 +3164,20 @@ class F1ProjectionApp(tk.Tk):
             else:
                 projections = calculate_all_projections(
                     circuit_key, self.historical_data, quali or None, live_fp,
-                    cumulative_baselines=cum_baselines)
+                    cumulative_baselines=cum_baselines,
+                    season_dnf_tracker=self.season_dnf_tracker)
                 mode_text = "No sprint race at this circuit — showing Grand Prix projection"
         elif mode == "Grand Prix +Q" and quali:
             projections = calculate_qualifying_projections(
                 circuit_key, quali, quali_times, self.historical_data, live_fp,
-                cumulative_baselines=cum_baselines)
+                cumulative_baselines=cum_baselines,
+                season_dnf_tracker=self.season_dnf_tracker)
             mode_text = "Grand Prix +Q (FP1/2/3 + Qualifying) + Historical"
         else:
             projections = calculate_all_projections(
                 circuit_key, self.historical_data, quali or None, live_fp,
-                cumulative_baselines=cum_baselines)
+                cumulative_baselines=cum_baselines,
+                season_dnf_tracker=self.season_dnf_tracker)
             mode_text = "Grand Prix (FP1/2/3) + Historical"
             if mode == "Grand Prix +Q" and not quali:
                 mode_text += " (no qualifying data yet)"
