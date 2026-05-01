@@ -1821,6 +1821,34 @@ def fetch_raw_season_data(year=2026, historical=None, progress_callback=None) ->
                 sum(ratios) / len(ratios), 6)
             result["calibration_races"] = len(ratios)
 
+    # Fallback Miami FP1 data from formula1.com (2026-05-01)
+    # Used when f1db hasn't published Miami FP1 yet
+    if "miami" not in result["live_fp_times"]:
+        result["live_fp_times"]["miami"] = {
+            "Charles Leclerc": 89.310,
+            "Max Verstappen": 89.607,
+            "Oscar Piastri": 89.758,
+            "Lewis Hamilton": 89.777,
+            "Kimi Antonelli": 90.079,
+            "George Russell": 90.100,
+            "Lando Norris": 90.208,
+            "Pierre Gasly": 90.587,
+            "Isack Hadjar": 90.873,
+            "Carlos Sainz": 90.930,
+            "Franco Colapinto": 91.015,
+            "Alexander Albon": 91.024,
+            "Oliver Bearman": 91.091,
+            "Gabriel Bortoleto": 91.111,
+            "Nico Hulkenberg": 91.595,
+            "Esteban Ocon": 91.635,
+            "Liam Lawson": 91.648,
+            "Sergio Perez": 92.047,
+            "Fernando Alonso": 92.593,
+            "Valtteri Bottas": 92.762,
+            "Arvid Lindblad": 92.862,
+            "Lance Stroll": 92.959,
+        }
+
     return result
 
 
