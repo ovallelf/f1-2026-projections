@@ -34,7 +34,7 @@ CIRCUITS_2026 = {
     "suzuka": {"name": "Japanese GP", "location": "Suzuka", "km": 5.807, "turns": 18, "type": "technical", "ratio": 1.140, "laps": 53},
     "bahrain": {"name": "Bahrain GP", "location": "Sakhir", "km": 5.412, "turns": 15, "type": "mixed", "ratio": 1.146, "laps": 57},
     "jeddah": {"name": "Saudi Arabian GP", "location": "Jeddah", "km": 6.174, "turns": 27, "type": "power", "ratio": 1.094, "laps": 50},
-    "miami": {"name": "Miami GP", "location": "Miami", "km": 5.412, "turns": 19, "type": "mixed", "ratio": 1.124, "laps": 57},
+    "miami": {"name": "Miami GP", "location": "Miami", "km": 5.412, "turns": 19, "type": "mixed", "ratio": 1.130, "laps": 57},
     "montreal": {"name": "Canadian GP", "location": "Montreal", "km": 4.361, "turns": 14, "type": "power", "ratio": 0.916, "laps": 70},
     "monaco": {"name": "Monaco GP", "location": "Monte Carlo", "km": 3.337, "turns": 19, "type": "technical", "ratio": 0.913, "laps": 78},
     "barcelona": {"name": "Spanish GP (Barcelona)", "location": "Barcelona", "km": 4.657, "turns": 14, "type": "technical", "ratio": 0.956, "laps": 66},
@@ -87,10 +87,6 @@ DRIVERS_2026 = [
 # FP3 is closest to qualifying/race conditions; FP1 is exploratory
 FP_WEIGHTS = {"fp1": 0.20, "fp2": 0.35, "fp3": 0.45}
 
-# Grid-midfield reference lap time at Albert Park (seconds). Used only to derive
-# circuit reference times via ratio for circuits with no live FP data.
-REFERENCE_LAP_TIME = 81.0
-
 
 def compute_composite_baseline(driver: dict) -> float:
     """Compute a weighted composite baseline from available FP sessions.
@@ -111,6 +107,13 @@ def compute_composite_baseline(driver: dict) -> float:
 
     if len(sessions) == 1:
         return next(iter(sessions.values()))
+
+    # Outlier detection: exclude sessions >2.0s slower than median of others
+    sorted_times = sorted(sessions.values())
+    median_val = sorted_times[len(sorted_times) // 2]
+    filtered = {k: v for k, v in sessions.items() if v <= median_val + 2.0}
+    if filtered:
+        sessions = filtered
 
     # Redistribute weights across available sessions
     total_weight = sum(FP_WEIGHTS[k] for k in sessions)
@@ -139,7 +142,7 @@ CIRCUIT_OVERTAKING = {
     "suzuka":      0.35,   # Difficult – few overtaking zones, high-speed corners
     "bahrain":     0.80,   # Excellent – multiple DRS zones, wide braking zones
     "jeddah":      0.60,   # Moderate – fast street circuit, DRS effective
-    "miami":       0.50,   # Moderate – limited overtaking zones
+    "miami":       0.55,   # Moderate – T1 braking, T11 back straight, T17 hairpin
     "montreal":    0.65,   # Good – long straights, heavy braking chicanes
     "monaco":      0.05,   # Near impossible – narrowest track on calendar
     "barcelona":   0.40,   # Difficult – dirty air through sector 3
@@ -1834,8 +1837,8 @@ def calculate_all_projections(circuit_key: str, historical: dict | None = None,
     Projection priority per driver:
     1. Live FP data from this circuit (used directly, no ratio scaling).
     2. Albert Park baselines (only when circuit_key == 'albert_park').
-    3. Circuit reference time from REFERENCE_LAP_TIME × ratio, differentiated
-       only by historical factor and team affinity.
+    3. Driver-specific baseline from compute_composite_baseline × circuit ratio,
+       differentiated by historical factor and team affinity.
     """
     circuit = CIRCUITS_2026[circuit_key]
     target_ratio = circuit["ratio"]
@@ -1858,9 +1861,9 @@ def calculate_all_projections(circuit_key: str, historical: dict | None = None,
             baseline = compute_composite_baseline(driver)
             projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
         else:
-            # No circuit-specific FP data — use circuit reference + historical/affinity
-            circuit_ref = REFERENCE_LAP_TIME * target_ratio
-            projected_lap = circuit_ref * affinity * GLOBAL_CORRECTION * hist_factor
+            # No circuit-specific FP data — scale Albert Park baseline by circuit ratio
+            baseline = compute_composite_baseline(driver)
+            projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
         total_race = projected_lap * race_laps
         results.append({
             "driver": driver["name"],
@@ -2010,8 +2013,8 @@ def calculate_qualifying_projections(circuit_key: str,
                 baseline = compute_composite_baseline(driver)
                 projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
             else:
-                circuit_ref = REFERENCE_LAP_TIME * target_ratio
-                projected_lap = circuit_ref * affinity * GLOBAL_CORRECTION * hist_factor
+                baseline = compute_composite_baseline(driver)
+                projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
 
         total_race = projected_lap * race_laps
 
@@ -2100,8 +2103,8 @@ def calculate_sprint_projections(circuit_key: str,
                 baseline = compute_composite_baseline(driver)
                 projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
             else:
-                circuit_ref = REFERENCE_LAP_TIME * target_ratio
-                projected_lap = circuit_ref * affinity * GLOBAL_CORRECTION * hist_factor
+                baseline = compute_composite_baseline(driver)
+                projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
 
         total_time = projected_lap * sprint_laps
 
