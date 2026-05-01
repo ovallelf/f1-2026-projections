@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "script",
+    "author": "GitHub Copilot",
+    "description": {
+        "": "Change the diameter or radius of selected circular edges, faces, or sketch circles"
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}

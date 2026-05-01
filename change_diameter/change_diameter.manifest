@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "script",
+    "author": "GitHub Copilot",
+    "description": {
+        "": "Change the second largest diameter parameter to 28.3 mm"
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
