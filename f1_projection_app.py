@@ -1,10 +1,10 @@
 """F1 2026 Race Time Projection App
 
 Projects total race times for all 22 drivers across the 2026 calendar
-using Albert Park FP1/FP2/FP3 baselines (weighted composite) scaled by
-circuit ratios, team-affinity multipliers, and race lap counts.  Includes
-per-circuit overtaking difficulty coefficients and per-driver DNF
-probabilities to compute expected points (E[Pts]).
+using cumulative baselines that blend race pace (70 %) with FP pace (30 %)
+from all completed races, normalized by circuit ratios and weighted by
+recency (λ=0.85).  Includes team-affinity multipliers, dynamic DNF
+probabilities, and expected points (E[Pts]) with overtaking difficulty.
 """
 
 import tkinter as tk
@@ -55,7 +55,7 @@ CIRCUITS_2026 = {
     "yas_marina": {"name": "Abu Dhabi GP", "location": "Abu Dhabi", "km": 5.281, "turns": 16, "type": "mixed", "ratio": 1.079, "laps": 58},
 }
 
-# Step 1.2 – Driver roster (22 drivers, FP1/FP2/FP3 baselines from Albert Park)
+# Step 1.2 – Driver roster (22 drivers, FP1/FP2/FP3 baselines — Round 1 fallback only)
 # data_quality: "measured" = representative lap set, "estimated" = indirect estimation
 # fp1/fp2/fp3: best lap time in seconds from each session (None = no representative time)
 DRIVERS_2026 = [
@@ -2592,7 +2592,7 @@ class F1ProjectionApp(tk.Tk):
         frame = ttk.Frame(self, padding=(20, 15, 20, 5))
         frame.grid(row=0, column=0, sticky="ew")
         ttk.Label(frame, text="F1 2026 RACE TIME PROJECTIONS", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="Based on Australian GP FP1/FP2/FP3 data (weighted composite) · Historical: f1nsight-api-2 · Latest: f1db",
+        ttk.Label(frame, text="Cumulative race pace (70%) + FP (30%) baselines · Dynamic DNF · Historical: f1nsight-api-2 · Latest: f1db",
                   style="Sub.TLabel").pack(anchor="w")
         self.status_label = ttk.Label(frame, text="", style="Sub.TLabel")
         self.status_label.pack(anchor="w")
