@@ -128,29 +128,65 @@ def compute_composite_baseline(driver: dict) -> float:
 def compute_cumulative_baseline(driver_name: str,
                                 live_fp_times: dict,
                                 completed_circuits: list[str],
-                                decay: float = RECENCY_DECAY) -> float | None:
+                                decay: float = RECENCY_DECAY,
+                                race_results: dict | None = None) -> float | None:
     """Compute a recency-weighted cumulative baseline from all completed races.
 
-    For each completed circuit with FP data for this driver:
-    1. Compute the per-circuit composite via compute_composite_baseline()
-    2. Normalize to Albert Park equivalent: composite / circuit_ratio
-    3. Apply exponential recency weighting (most recent race = weight 1.0)
+    For each completed circuit, blends two pace signals when available:
 
-    Returns None if no cumulative data is available (caller should fall back
-    to static DRIVERS_2026 baselines).
+    * **FP pace** — composite from FP1/FP2/FP3 sessions, normalized by
+      circuit ratio.  Weight: 30 %.
+    * **Race pace** — average race lap time (total time / laps), normalized
+      by circuit ratio.  Weight: 70 %.  Preferred because race pace is more
+      representative of true performance than practice running.
+
+    When only one signal is available for a circuit, that signal is used at
+    full weight.  Recency decay (λ=0.85) is applied across circuits.
+
+    Returns ``None`` when no data is available (caller should fall back to
+    static ``DRIVERS_2026`` baselines).
     """
+    FP_BLEND = 0.30      # weight for practice pace per circuit
+    RACE_BLEND = 0.70    # weight for race pace per circuit
+
     normalized = []  # list of (normalized_baseline, recency_weight)
     n = len(completed_circuits)
     for i, ck in enumerate(completed_circuits):
+        ratio = CIRCUITS_2026[ck]["ratio"]
+        race_laps = CIRCUITS_2026[ck]["laps"]
+        weight = decay ** (n - i - 1)
+
+        # --- FP pace signal ---
+        fp_norm = None
         circuit_fp = live_fp_times.get(ck, {})
         driver_fp = circuit_fp.get(driver_name)
-        if not driver_fp:
+        if driver_fp:
+            composite = compute_composite_baseline(driver_fp)
+            fp_norm = composite / ratio
+
+        # --- Race pace signal ---
+        race_norm = None
+        if race_results:
+            circuit_results = race_results.get(ck, [])
+            for entry in circuit_results:
+                if entry.get("driver") == driver_name:
+                    time_ms = entry.get("time_ms")
+                    if time_ms and not entry.get("retired", False) and race_laps > 0:
+                        avg_lap_s = (time_ms / 1000.0) / race_laps
+                        race_norm = avg_lap_s / ratio
+                    break
+
+        # --- Blend the two signals ---
+        if fp_norm is not None and race_norm is not None:
+            blended = FP_BLEND * fp_norm + RACE_BLEND * race_norm
+        elif race_norm is not None:
+            blended = race_norm
+        elif fp_norm is not None:
+            blended = fp_norm
+        else:
             continue
-        composite = compute_composite_baseline(driver_fp)
-        ratio = CIRCUITS_2026[ck]["ratio"]
-        norm = composite / ratio  # normalize to Albert Park equivalent
-        weight = decay ** (n - i - 1)  # most recent = decay^0 = 1.0
-        normalized.append((norm, weight))
+
+        normalized.append((blended, weight))
 
     if not normalized:
         return None
@@ -160,9 +196,11 @@ def compute_cumulative_baseline(driver_name: str,
 
 
 def build_cumulative_baselines(live_fp_times: dict,
-                               session_completion: dict) -> dict[str, float]:
+                               session_completion: dict,
+                               race_results: dict | None = None) -> dict[str, float]:
     """Build cumulative baselines for all drivers from completed race weekends.
 
+    Blends FP pace (30 %) with race pace (70 %) when both are available.
     Returns {driver_name: normalized_baseline} for drivers with data.
     Circuits are considered completed when RACE_RESULT is in their session_completion set.
     """
@@ -175,7 +213,8 @@ def build_cumulative_baselines(live_fp_times: dict,
 
     baselines = {}
     for driver in DRIVERS_2026:
-        bl = compute_cumulative_baseline(driver["name"], live_fp_times, completed)
+        bl = compute_cumulative_baseline(driver["name"], live_fp_times, completed,
+                                         race_results=race_results)
         if bl is not None:
             baselines[driver["name"]] = bl
     return baselines
@@ -2307,7 +2346,8 @@ def calculate_season_projection(historical: dict | None = None,
                                 season_calendar: list | None = None,
                                 live_fp_times: dict | None = None,
                                 session_completion: dict | None = None,
-                                season_dnf_tracker: dict | None = None) -> list[dict]:
+                                season_dnf_tracker: dict | None = None,
+                                race_results: dict | None = None) -> list[dict]:
     """Project full-season championship standings.
 
     Sums expected points across all 24 circuits. For completed races (when
@@ -2346,7 +2386,8 @@ def calculate_season_projection(historical: dict | None = None,
                     completed_circuits.add(ck)
 
     # Build cumulative baselines from all completed race weekends
-    cum_baselines = build_cumulative_baselines(live_fp_times or {}, session_completion or {})
+    cum_baselines = build_cumulative_baselines(live_fp_times or {}, session_completion or {},
+                                               race_results=race_results)
 
     # Project remaining races
     for circuit_key in CIRCUITS_2026:
@@ -2407,6 +2448,7 @@ def calculate_constructor_season_projection(
     session_completion: dict | None = None,
     actual_constructor_standings: list | None = None,
     season_dnf_tracker: dict | None = None,
+    race_results: dict | None = None,
 ) -> list[dict]:
     """Project full-season constructor championship standings.
 
@@ -2416,7 +2458,8 @@ def calculate_constructor_season_projection(
     # Get driver projections
     driver_proj = calculate_season_projection(
         historical, actual_standings, season_calendar,
-        live_fp_times, session_completion, season_dnf_tracker)
+        live_fp_times, session_completion, season_dnf_tracker,
+        race_results=race_results)
 
     # Aggregate by team tag
     team_totals: dict[str, dict] = {}
@@ -2981,6 +3024,7 @@ class F1ProjectionApp(tk.Tk):
             self.live_fp_times if self.live_fp_times else None,
             self.session_completion if self.session_completion else None,
             self.season_dnf_tracker if self.season_dnf_tracker else None,
+            self.race_results if self.race_results else None,
         )
 
         completed = sum(1 for e in self.season_calendar if e.get("completed")) if self.season_calendar else 0
@@ -3020,6 +3064,7 @@ class F1ProjectionApp(tk.Tk):
             self.session_completion if self.session_completion else None,
             self.constructor_standings if self.constructor_standings else None,
             self.season_dnf_tracker if self.season_dnf_tracker else None,
+            self.race_results if self.race_results else None,
         )
 
         for i, cp in enumerate(constr_proj, start=1):
@@ -3147,7 +3192,8 @@ class F1ProjectionApp(tk.Tk):
         quali = self.quali_results.get(circuit_key, {})
         quali_times = self.quali_times.get(circuit_key, {})
         live_fp = self.live_fp_times.get(circuit_key)
-        cum_baselines = build_cumulative_baselines(self.live_fp_times, self.session_completion)
+        cum_baselines = build_cumulative_baselines(self.live_fp_times, self.session_completion,
+                                                       race_results=self.race_results)
 
         if mode == "Sprint":
             if circuit_key in SPRINT_CIRCUITS:
