@@ -348,6 +348,7 @@ SPRINT_CIRCUITS = {
 }
 
 SQ_TO_SPRINT_FACTOR = 1.03   # Sprint qualifying → sprint race pace (~3% degradation)
+SPRINT_PACE_FACTOR = 0.97    # FP fallback → sprint pace (~3% faster: fresh tires, no stops)
 SPRINT_DNF_FACTOR = 0.50     # Sprint DNF probability = 50% of race DNF
 
 SESSION_TYPE_MAP = {
@@ -2310,16 +2311,17 @@ def calculate_sprint_projections(circuit_key: str,
             projected_lap = sq_time * SQ_TO_SPRINT_FACTOR * affinity * GLOBAL_CORRECTION * hist_factor
         else:
             # Fallback — prefer live circuit-specific FP data
+            # Apply sprint pace factor (~3% faster due to fresh tires, no stops, shorter distance)
             live_driver = (live_fp_data or {}).get(driver["name"])
             if live_driver:
                 baseline = compute_composite_baseline(live_driver)
-                projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor
+                projected_lap = baseline * affinity * GLOBAL_CORRECTION * hist_factor * SPRINT_PACE_FACTOR
             elif cumulative_baselines and driver["name"] in cumulative_baselines:
                 baseline = cumulative_baselines[driver["name"]]
-                projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
+                projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor * SPRINT_PACE_FACTOR
             else:
                 baseline = compute_composite_baseline(driver)
-                projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor
+                projected_lap = baseline * target_ratio * affinity * GLOBAL_CORRECTION * hist_factor * SPRINT_PACE_FACTOR
 
         total_time = projected_lap * sprint_laps
 
